@@ -1,0 +1,147 @@
+# =============================================================================
+# rb3_hand_mimic configuration
+# =============================================================================
+# Real-time robotic hand mimic demo for the Qualcomm RB3 Gen 2.
+# Every value here can be overridden; CLI flags (see `python main.py --help`)
+# take precedence over this file.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CAMERA
+# -----------------------------------------------------------------------------
+# The RB3 tracking camera (the smaller tracking lens) is the PRIMARY input.
+# We prefer low latency over image quality. The larger high-res camera is only
+# a fallback/debug source.
+camera:
+  preferred: "tracking"   # "tracking" | "main" | "any" -- hint for auto-select
+  index: "auto"           # "auto" or an integer (e.g. 2). "auto" runs discovery.
+  width: 640
+  height: 480
+  fps: 30                 # try 30 @ 640x480, or 60 @ 320x240 (see README tuning)
+  backend: "auto"         # "auto" | "v4l2" | "gstreamer" | "any"
+  mirror_preview: true    # flip the *preview* horizontally (selfie view)
+  rotate_degrees: 0       # 0 | 90 | 180 | 270 -- physical camera mounting
+  buffer_size: 1          # keep at 1: latest-frame-only, low latency
+  # Optional explicit allow/deny lists for auto-selection by /dev/video index.
+  prefer_indices: []      # e.g. [2, 3] to bias auto-select toward these
+  avoid_indices: []       # e.g. [0] to skip the main camera during auto-select
+
+# -----------------------------------------------------------------------------
+# TRACKER (hand landmark detection)
+# -----------------------------------------------------------------------------
+tracker:
+  backend: "mediapipe"        # "mediapipe" (only one shipped today; pluggable)
+  max_num_hands: 2
+  model_complexity: 0         # 0 = fastest (default), 1 = more accurate
+  min_detection_confidence: 0.6
+  min_tracking_confidence: 0.5
+  # Hand selection when multiple hands are visible:
+  select: "largest"           # "largest" | "left" | "right"
+  # Reject hands whose landmark score is below this before mapping.
+  min_hand_score: 0.5
+
+# -----------------------------------------------------------------------------
+# TRANSFORM (mirroring + handedness)  --  CRITICAL for correct mimicking
+# -----------------------------------------------------------------------------
+transform:
+  camera_mirror: true         # is the captured image mirrored (selfie)?
+  output_mirror: false        # mirror the finger mapping to the robot
+  user_hand: "auto"           # "auto" | "left" | "right" (expected user hand)
+  robot_hand: "right"         # physical handedness of the Paxini hand
+  palm_facing_camera: true    # demo assumption: palm toward the lens
+  invert_fingers: false       # if the robot closes when it should open
+  finger_order: ["thumb", "index", "middle", "ring", "pinky"]
+
+# -----------------------------------------------------------------------------
+# CALIBRATION
+# -----------------------------------------------------------------------------
+# Per-finger raw-curl ranges captured from open and closed poses.
+# Run:  python tools/record_calibration.py --config config.yaml
+# If absent/invalid, safe defaults below are used and a warning is logged.
+calibration:
+  enabled: true
+  file: "calibration.yaml"    # written by record_calibration.py (relative to config)
+  # Fallback ranges used when no calibration file exists. raw_open should map
+  # to curl 0.0, raw_closed to curl 1.0. These are conservative defaults.
+  defaults:
+    thumb:  { open: 0.15, closed: 0.80 }
+    index:  { open: 0.10, closed: 0.90 }
+    middle: { open: 0.10, closed: 0.90 }
+    ring:   { open: 0.10, closed: 0.90 }
+    pinky:  { open: 0.10, closed: 0.90 }
+  # Minimum separation between open and closed raw values to be considered valid.
+  min_separation: 0.15
+
+# -----------------------------------------------------------------------------
+# SMOOTHING
+# -----------------------------------------------------------------------------
+smoothing:
+  filter: "ema"        # "ema" | "one_euro" | "none"
+  ema_alpha: 0.5       # 0..1 ; higher = more responsive, lower = smoother
+  deadband: 0.02       # ignore changes smaller than this (anti-jitter)
+  # One Euro filter params (used when filter == "one_euro")
+  one_euro:
+    min_cutoff: 1.0
+    beta: 0.02
+    d_cutoff: 1.0
+
+# -----------------------------------------------------------------------------
+# SAFETY
+# -----------------------------------------------------------------------------
+safety:
+  output_min: 0.0
+  output_max: 1.0
+  # When tracking is lost: hold the last pose for `hold_seconds`, then ease
+  # back to the rest pose over `return_seconds`.
+  hold_seconds: 0.5
+  return_seconds: 1.0
+  # Watchdog: if no fresh pose for this long, force return-to-rest.
+  watchdog_seconds: 1.5
+  # Maximum per-command change per finger (rate limit, units = curl 0..1).
+  # Prevents servo slamming. Set high (e.g. 1.0) to disable.
+  max_step_per_command: 0.25
+
+# -----------------------------------------------------------------------------
+# HAND (robotic hand controller)  --  Paxini protocol is configurable
+# -----------------------------------------------------------------------------
+hand:
+  controller: "serial"     # "serial" | "mock"   (--dry-run forces "mock")
+  port: "auto"             # "auto" or explicit, e.g. "/dev/ttyACM0"
+  baudrate: 115200
+  timeout: 0.02            # write/read timeout seconds (keep small, non-blocking)
+  command_rate_hz: 30      # cap outgoing command frequency
+  protocol: "csv"          # "csv" | "labeled_csv" | "json"
+  newline: true            # append "\n" to each command
+  value_type: "normalized" # "normalized" (0..1) | "servo" (servo_min..servo_max)
+  servo_min: 0
+  servo_max: 180
+  decimals: 3              # rounding for normalized text protocols
+  # Pose sent on startup, on Ctrl+C, and after tracking loss.
+  rest_pose:
+    thumb: 0.0
+    index: 0.0
+    middle: 0.0
+    ring: 0.0
+    pinky: 0.0
+
+# -----------------------------------------------------------------------------
+# DEBUG
+# -----------------------------------------------------------------------------
+debug:
+  show_window: true        # OpenCV window (ignored in --headless / --no-window)
+  draw_landmarks: true
+  draw_curl_bars: true
+  draw_fps: true
+  window_name: "rb3_hand_mimic"
+  # In headless mode, log a status line every N seconds.
+  headless_status_seconds: 3.0
+  save_debug_frames: false # periodically dump frames to debug_frames/
+  debug_frame_dir: "debug_frames"
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"            # DEBUG | INFO | WARNING | ERROR
+  file: null               # null = stderr only; or a path like "run.log"
+  format: "%(asctime)s %(levelname)-7s %(name)s: %(message)s"

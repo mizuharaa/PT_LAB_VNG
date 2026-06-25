@@ -1,0 +1,15 @@
+# Core runtime dependencies for rb3_hand_mimic
+#
+# Notes for Qualcomm RB3 Gen 2 (ARM64 / aarch64):
+#  - opencv-python wheels exist for aarch64; if pip install is slow or fails,
+#    fall back to the distro package:  sudo apt install -y python3-opencv
+#  - mediapipe publishes aarch64 wheels for recent versions. If it will not
+#    install on the RB3, the tracker is behind an interface (see
+#    src/hand_tracker.py) so it can be swapped for TFLite/ONNX/QNN later.
+#    The rest of the pipeline still runs with --dry-run for bring-up.
+
+numpy>=1.23,<2.0
+opencv-python>=4.7,<5.0
+mediapipe>=0.10.9 ; platform_machine != "unsupported"
+pyserial>=3.5
+PyYAML>=6.0
