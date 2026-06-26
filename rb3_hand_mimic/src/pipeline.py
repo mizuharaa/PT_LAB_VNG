@@ -35,9 +35,10 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
+from .fusion import FusionConfig, fuse_curls
 from .metrics import Metrics
 from .utils import get_logger
 
@@ -209,6 +210,7 @@ class ControlWorker(threading.Thread):
         self._command: Dict[str, float] = {}
         self._track_state = "rest"
         self._connected = False
+        self._handedness = "Unknown"
 
     def run(self) -> None:
         self._running.set()
@@ -223,6 +225,8 @@ class ControlWorker(threading.Thread):
             # observe the absence and ease back to rest.
             if is_new and sample is not None and sample.detected and sample.values:
                 self.safety.update_pose(sample.values, now=now)
+                with self._state_lock:
+                    self._handedness = sample.handedness or "Unknown"
 
             command = self.safety.compute_output(now=now)
             sent = self.controller.send(command)
@@ -247,10 +251,85 @@ class ControlWorker(threading.Thread):
                     time.sleep(self._period - elapsed)
         log.info("control worker stopped")
 
-    def status(self) -> Tuple[Dict[str, float], str, bool]:
-        """Return (last_command, track_state, controller_connected)."""
+    def status(self) -> Tuple[Dict[str, float], str, bool, str]:
+        """Return (last_command, track_state, controller_connected, handedness)."""
         with self._state_lock:
-            return dict(self._command), self._track_state, self._connected
+            return (dict(self._command), self._track_state,
+                    self._connected, self._handedness)
+
+    def set_slot(self, slot: LatestSlot) -> None:
+        """Repoint the control input at a new slot (used after a live camera
+        rebuild). A single reference swap is atomic in CPython; the new slot
+        brings its own freshness tracking."""
+        self.slot = slot
+
+    def stop(self) -> None:
+        self._running.clear()
+
+
+class FusionWorker(threading.Thread):
+    """Fuses the latest PoseSample from several detection slots into one and
+    publishes it to the control slot. Only created when >1 camera is active;
+    with a single camera the detection worker writes the control slot directly,
+    so this stage costs nothing in the default configuration.
+    """
+
+    def __init__(
+        self,
+        in_slots: List[LatestSlot],
+        out_slot: LatestSlot,
+        fusion_cfg: FusionConfig,
+        tick_hz: float = 120.0,
+    ) -> None:
+        super().__init__(name="fusion", daemon=True)
+        self.in_slots = in_slots
+        self.out_slot = out_slot
+        self.fusion_cfg = fusion_cfg
+        self._period = 1.0 / tick_hz if tick_hz > 0 else 0.0
+        self._running = threading.Event()
+        self._seq = 0
+
+    def run(self) -> None:
+        self._running.set()
+        log.info("fusion worker started (%d cameras)", len(self.in_slots))
+        while self._running.is_set():
+            loop_start = time.perf_counter()
+            fetched = [slot.get_fresh() for slot in self.in_slots]
+            if any(is_new for _, is_new in fetched):
+                sources = []
+                capture_ts = detect_ts = 0.0
+                handedness = "Unknown"
+                confidence = 0.0
+                for sample, _ in fetched:
+                    if sample is not None and sample.detected and sample.values:
+                        sources.append((sample.values, sample.confidence))
+                        # Carry timestamps/handedness from the freshest detection.
+                        if sample.detect_ts > detect_ts:
+                            detect_ts = sample.detect_ts
+                            capture_ts = sample.capture_ts
+                            handedness = sample.handedness
+                            confidence = sample.confidence
+                    else:
+                        sources.append((None, 0.0))
+
+                fused = fuse_curls(sources, self.fusion_cfg)
+                now = time.perf_counter()
+                self._seq += 1
+                self.out_slot.put(PoseSample(
+                    frame_id=self._seq,
+                    capture_ts=capture_ts or now,
+                    detect_ts=detect_ts or now,
+                    detected=fused is not None,
+                    handedness=handedness,
+                    confidence=confidence,
+                    values=fused,
+                ))
+
+            if self._period > 0:
+                elapsed = time.perf_counter() - loop_start
+                if elapsed < self._period:
+                    time.sleep(self._period - elapsed)
+        log.info("fusion worker stopped")
 
     def stop(self) -> None:
         self._running.clear()

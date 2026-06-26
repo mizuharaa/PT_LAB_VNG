@@ -34,11 +34,36 @@ INDEX = (5, 6, 7, 8)        # MCP, PIP, DIP, TIP
 MIDDLE = (9, 10, 11, 12)
 RING = (13, 14, 15, 16)
 PINKY = (17, 18, 19, 20)
+INDEX_MCP = 5
+PINKY_MCP = 17
 
-# Joint-angle range used to normalize curl. A fully straight finger sits near
-# 180 deg; a tightly curled finger reaches roughly 60-90 deg at the joints.
-ANGLE_STRAIGHT = 180.0
-ANGLE_CURLED = 70.0
+# Finger curl blends two cues, both from 3D world landmarks:
+#   1. ANGLE: summed flexion at MCP + PIP + DIP. Sensitive to any joint moving.
+#   2. FOLD : how far the fingertip has folded back toward its own MCP knuckle
+#            (tip->MCP distance / finger length). ~1.0 straight, ~0.3 curled.
+# The fold cue matters because (a) it lifts the mid-range so a *partial* bend
+# already carries real weight, and (b) it stays meaningful when fingers tuck
+# behind the palm and the joint angles "mesh"/collapse -- the tip-to-base
+# distance still shrinks even when the per-joint angles get unreliable. Tuned so
+# a comfortable (not maximal) close reaches ~1.0 and a half-bend reads ~0.5;
+# per-user calibration then fine-tunes. Lower FINGER_FULL_DEG = more gain so you
+# don't have to crush a full fist to hit 1.0.
+FINGER_FULL_DEG = 210.0      # divisor mapping summed finger flexion -> [0, 1]
+FINGER_FOLD_OPEN = 1.00      # tip/MCP-distance ratio when the finger is straight
+FINGER_FOLD_CLOSED = 0.35    # ...and when fully folded
+FINGER_W_ANGLE = 0.55        # blend weight: joint-angle cue
+FINGER_W_FOLD = 0.45         # blend weight: fold-distance cue (occlusion-robust)
+THUMB_FLEX_FULL_DEG = 100.0  # divisor for thumb's 2-joint flexion sum
+
+# Thumb adduction (folding across the palm) measured as tip->index-MCP distance
+# normalized by palm width. Far (abducted/open) ~1.3, near (adducted/closed)
+# ~0.5. This is what makes sideways ("horizontal") thumb motion register.
+THUMB_ADD_OPEN = 1.30
+THUMB_ADD_CLOSED = 0.50
+# Blend of thumb flexion vs adduction. Adduction is weighted a bit higher so
+# horizontal thumb motion is captured, while flexion still closes it in a fist.
+THUMB_W_FLEX = 0.45
+THUMB_W_ADD = 0.55
 
 
 @dataclass
@@ -88,53 +113,63 @@ class HandPose:
 
 def _palm_width(pts: np.ndarray) -> float:
     """Distance between index MCP (5) and pinky MCP (17): a scale reference."""
-    return float(np.linalg.norm(pts[5] - pts[17])) + 1e-6
+    return float(np.linalg.norm(pts[INDEX_MCP] - pts[PINKY_MCP])) + 1e-6
 
 
 def _finger_curl_4pt(pts: np.ndarray, idx: tuple) -> float:
-    """Raw curl for a 4-landmark finger using MCP & PIP joint angles.
+    """Raw curl for a 4-landmark finger: blend of joint-angle and fold-distance.
 
-    idx = (mcp, pip, dip, tip). Uses 3D landmarks so the estimate degrades
-    gracefully when the finger points toward the camera.
+    idx = (mcp, pip, dip, tip). The angle cue sums the bend at MCP+PIP+DIP (each
+    ~0 deg straight, growing as it bends). The fold cue is the fingertip's
+    distance back to its own MCP, normalized by the finger's length (~1.0
+    straight, ~0.3 folded), which lifts partial bends and survives occlusion.
+    Both come from 3D world landmarks, so the result is largely orientation
+    invariant.
     """
     mcp, pip, dip, tip = (pts[i] for i in idx)
-    # Angle at MCP joint: vector toward wrist-side is approximated by (mcp->pip)
-    # reversed against (mcp->wrist) is unstable, so use the finger's own chain:
-    angle_mcp = angle_between(pip - mcp, dip - pip)  # bend between 1st & 2nd seg
-    angle_pip = angle_between(dip - pip, tip - dip)  # bend between 2nd & 3rd seg
-    # A straight finger -> both angles near 0 deg of *deviation*; angle_between
-    # of consecutive segment directions is ~0 when straight and grows when bent.
-    # Convert "deviation from straight" into curl: 0 deviation -> open.
-    deviation = (angle_mcp + angle_pip) * 0.5  # 0..~120
-    # Map deviation [0, (180-ANGLE_CURLED)] -> curl [0, 1].
-    max_dev = ANGLE_STRAIGHT - ANGLE_CURLED
-    return clamp(deviation / max_dev, 0.0, 1.0)
+    bend_mcp = angle_between(mcp - pts[WRIST], pip - mcp)  # knuckle flexion vs palm
+    bend_pip = angle_between(pip - mcp, dip - pip)         # 1st interphalangeal
+    bend_dip = angle_between(dip - pip, tip - dip)         # 2nd interphalangeal
+    angle_curl = clamp((bend_mcp + bend_pip + bend_dip) / FINGER_FULL_DEG, 0.0, 1.0)
+
+    finger_len = (
+        float(np.linalg.norm(pip - mcp))
+        + float(np.linalg.norm(dip - pip))
+        + float(np.linalg.norm(tip - dip))
+        + 1e-6
+    )
+    fold_ratio = float(np.linalg.norm(tip - mcp)) / finger_len
+    fold_curl = normalize_range(fold_ratio, FINGER_FOLD_OPEN, FINGER_FOLD_CLOSED)
+
+    return clamp(FINGER_W_ANGLE * angle_curl + FINGER_W_FOLD * fold_curl, 0.0, 1.0)
 
 
 def _thumb_curl(pts: np.ndarray) -> float:
-    """Raw thumb curl combining joint bend and fold-across-palm distance."""
+    """Raw thumb curl: blend of joint flexion and adduction across the palm.
+
+    Pure flexion barely moves when the thumb sweeps sideways, so we add an
+    adduction term (thumb tip distance to the index MCP, normalized by palm
+    width). That makes horizontal thumb motion register, while the flexion term
+    still closes the thumb in a fist.
+    """
     cmc, mcp, ip, tip = (pts[i] for i in THUMB)
-    # Joint bend (deviation from straight), same convention as other fingers.
-    angle_mcp = angle_between(ip - mcp, mcp - cmc)
-    angle_ip = angle_between(tip - ip, ip - mcp)
-    deviation = (angle_mcp + angle_ip) * 0.5
-    max_dev = ANGLE_STRAIGHT - ANGLE_CURLED
-    bend_curl = clamp(deviation / max_dev, 0.0, 1.0)
+    bend_mcp = angle_between(mcp - cmc, ip - mcp)
+    bend_ip = angle_between(ip - mcp, tip - ip)
+    flex = clamp((bend_mcp + bend_ip) / THUMB_FLEX_FULL_DEG, 0.0, 1.0)
 
-    # Fold metric: thumb tip approaches the pinky MCP when closing across palm.
     palm_w = _palm_width(pts)
-    tip_to_pinky = float(np.linalg.norm(pts[4] - pts[17])) / palm_w
-    # Open thumb: tip far from pinky MCP (ratio ~1.2+); closed: ratio ~0.4.
-    fold_curl = normalize_range(tip_to_pinky, 1.2, 0.45)
+    tip_to_index = float(np.linalg.norm(pts[4] - pts[INDEX_MCP])) / palm_w
+    add = normalize_range(tip_to_index, THUMB_ADD_OPEN, THUMB_ADD_CLOSED)
 
-    # Weight the fold metric a bit higher: it captures abduction the joint
-    # angles miss. Tunable, but works well with palm-facing-camera demos.
-    return clamp(0.4 * bend_curl + 0.6 * fold_curl, 0.0, 1.0)
+    return clamp(THUMB_W_FLEX * flex + THUMB_W_ADD * add, 0.0, 1.0)
 
 
-def compute_raw_curls(hand: HandLandmarks) -> Dict[str, float]:
-    """Compute raw (un-calibrated) curl values for all five fingers."""
-    pts = hand.points
+def compute_raw_curls(pts: np.ndarray) -> Dict[str, float]:
+    """Compute raw (un-calibrated) curl values for all five fingers.
+
+    `pts` is a (21, 3) landmark array -- pass world landmarks when available for
+    orientation-invariant results.
+    """
     return {
         "thumb": _thumb_curl(pts),
         "index": _finger_curl_4pt(pts, INDEX),
@@ -148,7 +183,10 @@ class GestureMapper:
     """Stateless mapper from landmarks to raw HandPose (pre-calibration)."""
 
     def map(self, hand: HandLandmarks) -> HandPose:
-        raw = compute_raw_curls(hand)
+        # World landmarks are metric and orientation-normalized, giving far more
+        # consistent curls across hand angles; fall back to image landmarks.
+        pts = hand.world_points if hand.world_points is not None else hand.points
+        raw = compute_raw_curls(pts)
         return HandPose(
             thumb=raw["thumb"],
             index=raw["index"],

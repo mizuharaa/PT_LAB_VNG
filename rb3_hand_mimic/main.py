@@ -30,7 +30,7 @@ import os
 import signal
 import sys
 import time
-from typing import Optional
+from typing import List, Optional
 
 # Ensure local package import works regardless of CWD.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,25 +42,33 @@ from src.camera import (  # noqa: E402
     discover_cameras,
     open_camera_from_config,
 )
+from src.debug_menu import DebugMenu, MenuItem  # noqa: E402
 from src.diagnostics import Diagnostics, HeadlessReporter, draw_overlay  # noqa: E402
 from src.gesture_mapper import GestureMapper  # noqa: E402
+from src.gesture_recognizer import classify  # noqa: E402
 from src.hand_controller import (  # noqa: E402
     BaseHandController,
     HandConfig,
     create_controller,
     list_serial_ports,
 )
+from src.fusion import FusionConfig  # noqa: E402
 from src.hand_tracker import (  # noqa: E402
     BaseHandTracker,
     TrackerConfig,
     create_tracker,
 )
 from src.metrics import Metrics  # noqa: E402
-from src.pipeline import ControlWorker, DetectionWorker, LatestSlot  # noqa: E402
+from src.pipeline import (  # noqa: E402
+    ControlWorker,
+    DetectionWorker,
+    FusionWorker,
+    LatestSlot,
+)
 from src.safety import SafetyConfig, SafetyManager  # noqa: E402
 from src.smoothing import Smoother, SmoothingConfig  # noqa: E402
 from src.transform import Transform, TransformConfig  # noqa: E402
-from src.utils import get_logger, load_config, setup_logging  # noqa: E402
+from src.utils import FINGERS, clamp, get_logger, load_config, setup_logging  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +88,9 @@ def parse_args() -> argparse.Namespace:
         help="Measure detection responsiveness. Optional duration in seconds "
              "(omit value to run until Ctrl+C). No window unless --debug is also set.",
     )
-    p.add_argument("--camera-index", type=int, default=None, help="Force a camera index")
+    p.add_argument("--camera-index", type=int, default=None, help="Force the primary camera index")
+    p.add_argument("--camera2-index", type=int, default=None,
+                   help="Enable the second (fusion) camera at this index")
     p.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     p.add_argument("--list-cameras", action="store_true", help="Discover cameras and exit")
     p.add_argument("--list-serial", action="store_true", help="List serial ports and exit")
@@ -118,23 +128,39 @@ class HandMimicApp:
         self.benchmark = args.benchmark is not None
         self.benchmark_seconds = float(args.benchmark or 0.0)
 
-        # Stateless / single-thread-safe pipeline objects.
+        # Shared, stateless pipeline objects (safe to use from one thread each).
         self.mapper = GestureMapper()
         self.calibration = load_calibration(self.cfg, args.config)
-        self.transform = Transform(self.transform_cfg)
-        self.smoother = Smoother(self.smoothing_cfg)
         self.safety = SafetyManager(self.safety_cfg, self.hand_cfg.rest_pose)
 
         # Async machinery.
         self.metrics = Metrics(window=int(self.pipeline_cfg.get("metrics_window", 150)))
-        self.slot = LatestSlot()
         self.control_tick_hz = float(self.pipeline_cfg.get("control_tick_hz", 120.0))
+        self.fusion_cfg = FusionConfig.from_dict(self.cfg.get("fusion", {}))
 
-        # Created in setup().
-        self.camera: Optional[Camera] = None
-        self.tracker: Optional[BaseHandTracker] = None
+        # Dual-camera (opt-in): a second camera at a known offset sees fingers
+        # the first view occludes; their per-finger curls are fused. Off by
+        # default, so the standard path stays single-camera and lightweight.
+        cam2 = self.cfg.get("camera2", {}) or {}
+        self.dual = bool(cam2.get("enabled", False)) or args.camera2_index is not None
+        # Secondary camera config = primary's settings overlaid with camera2 keys.
+        self.cam2_cfg = CameraConfig.from_dict({**(self.cfg.get("camera", {}) or {}), **cam2})
+        # Camera index selections (None = auto-discover). Editable via the debug
+        # menu; camera/dual changes are applied by rebuilding the detection layer.
+        self.cam0_index: Optional[int] = args.camera_index
+        if args.camera2_index is not None:
+            self.cam1_index: Optional[int] = args.camera2_index
+        else:
+            _c1 = cam2.get("index", 1)
+            self.cam1_index = _c1 if isinstance(_c1, int) else None
+
+        # Pipeline objects created in setup() (lists support 1 or 2 cameras).
         self.controller: Optional[BaseHandController] = None
-        self.detection: Optional[DetectionWorker] = None
+        self.cameras: List[Camera] = []
+        self.detections: List[DetectionWorker] = []
+        self.det_slots: List[LatestSlot] = []
+        self.control_slot = LatestSlot()
+        self.fusion: Optional[FusionWorker] = None
         self.control: Optional[ControlWorker] = None
 
         self.diag = Diagnostics()
@@ -159,6 +185,63 @@ class HandMimicApp:
             self.pipeline_cfg.get("benchmark_report_seconds", 1.0)
         )
 
+        # In-window debug menu (press 'm' in the debug window).
+        self.menu = self._build_menu()
+
+    # -- debug menu ---------------------------------------------------------
+    def _build_menu(self) -> DebugMenu:
+        """Construct the debug-menu items bound to this app's live state."""
+        index_cycle: List[Optional[int]] = [None, 0, 1, 2, 3, 4, 5, 6, 7]
+
+        def fmt_idx(v: Optional[int]) -> str:
+            return "auto" if v is None else str(v)
+
+        def cycle_idx(cur: Optional[int], delta: int) -> Optional[int]:
+            pos = index_cycle.index(cur) if cur in index_cycle else 0
+            return index_cycle[(pos + delta) % len(index_cycle)]
+
+        def set_cam0(d: int) -> None:
+            self.cam0_index = cycle_idx(self.cam0_index, d)
+
+        def set_cam1(d: int) -> None:
+            self.cam1_index = cycle_idx(self.cam1_index, d)
+
+        def toggle_dual(_d: int) -> None:
+            self.dual = not self.dual
+
+        def toggle_mirror(_d: int) -> None:
+            self.cam_cfg.mirror_preview = not self.cam_cfg.mirror_preview
+
+        def toggle_landmarks(_d: int) -> None:
+            self.debug_cfg["draw_landmarks"] = not self.debug_cfg.get("draw_landmarks", True)
+
+        def toggle_out_mirror(_d: int) -> None:
+            # Transform objects hold this cfg by reference, so flipping it is live.
+            self.transform_cfg.output_mirror = not self.transform_cfg.output_mirror
+            self.diag.output_mirror = self.transform_cfg.output_mirror
+
+        def adj_fusion(d: int) -> None:
+            self.fusion_cfg.min_confidence = clamp(
+                round(self.fusion_cfg.min_confidence + d * 0.05, 2), 0.0, 1.0)
+
+        items = [
+            MenuItem("Dual camera", lambda: "ON" if self.dual else "OFF", toggle_dual, pending=True),
+            MenuItem("Camera 0 index", lambda: fmt_idx(self.cam0_index), set_cam0, pending=True),
+            MenuItem("Camera 1 index", lambda: fmt_idx(self.cam1_index), set_cam1, pending=True),
+            MenuItem("APPLY camera changes", lambda: "[Enter]", lambda _d: None,
+                     on_select=lambda: "apply_cameras"),
+            MenuItem("Mirror preview",
+                     lambda: "ON" if self.cam_cfg.mirror_preview else "OFF", toggle_mirror),
+            MenuItem("Draw landmarks",
+                     lambda: "ON" if self.debug_cfg.get("draw_landmarks", True) else "OFF",
+                     toggle_landmarks),
+            MenuItem("Output mirror (robot)",
+                     lambda: "ON" if self.transform_cfg.output_mirror else "OFF", toggle_out_mirror),
+            MenuItem("Fusion min-confidence",
+                     lambda: f"{self.fusion_cfg.min_confidence:.2f}", adj_fusion),
+        ]
+        return DebugMenu(items)
+
     # -- setup / teardown ---------------------------------------------------
     def setup(self) -> None:
         self.logger.info(
@@ -176,47 +259,132 @@ class HandMimicApp:
         self.controller.connect()
         self.controller.send_rest()
 
-        # Tracker (may raise a clear SystemExit if MediaPipe is missing).
-        self.tracker = create_tracker(self.tracker_cfg)
-
-        # Camera.
-        self.camera = open_camera_from_config(self.cam_cfg, self.args.camera_index)
-        self.camera.start()
-        self.diag.camera_index = self.camera.index
-
         if self.calibration.source == "defaults":
             self.logger.warning("using DEFAULT calibration ranges; run "
                                 "tools/record_calibration.py for best accuracy")
 
-        # Build the async workers.
-        self.detection = DetectionWorker(
-            camera=self.camera,
-            tracker=self.tracker,
-            mapper=self.mapper,
-            calibration=self.calibration,
-            transform=self.transform,
-            smoother=self.smoother,
-            tracker_cfg=self.tracker_cfg,
-            slot=self.slot,
-            metrics=self.metrics,
-            keep_debug_frames=self.show_window,
-        )
+        self._build_detection_layer()
         self.control = ControlWorker(
             controller=self.controller,
             safety=self.safety,
-            slot=self.slot,
+            slot=self.control_slot,
             metrics=self.metrics,
             tick_hz=self.control_tick_hz,
         )
 
+    def _build_detection_layer(self) -> None:
+        """(Re)build cameras + per-camera detection workers + optional fusion.
+
+        Sets self.cameras / self.detections / self.det_slots / self.fusion and
+        points self.control_slot at whatever the control thread should consume
+        (the lone detection slot, or the fusion output). Safe to call again at
+        runtime after tearing the previous layer down (see _reconfigure_cameras).
+        """
+        self.cameras = []
+        self.detections = []
+        self.det_slots = []
+        self.fusion = None
+
+        # Each camera gets its OWN tracker + transform + smoother (all stateful)
+        # and its own slot; mapper and calibration are stateless and shared.
+        specs = [(self.cam0_index, self.cam_cfg)]
+        if self.dual:
+            specs.append((self.cam1_index, self.cam2_cfg))
+
+        for i, (forced_index, cam_cfg) in enumerate(specs):
+            try:
+                camera = open_camera_from_config(cam_cfg, forced_index)
+                camera.start()
+            except Exception as exc:  # noqa: BLE001
+                if i == 0:
+                    raise  # primary camera is required
+                self.logger.warning("secondary camera unavailable (%s); "
+                                    "continuing single-camera", exc)
+                break
+            tracker = create_tracker(self.tracker_cfg)
+            worker = DetectionWorker(
+                camera=camera,
+                tracker=tracker,
+                mapper=self.mapper,
+                calibration=self.calibration,
+                transform=Transform(self.transform_cfg),
+                smoother=Smoother(self.smoothing_cfg),
+                tracker_cfg=self.tracker_cfg,
+                slot=LatestSlot(),
+                metrics=self.metrics,
+                keep_debug_frames=self.show_window,
+            )
+            self.cameras.append(camera)
+            self.detections.append(worker)
+            self.det_slots.append(worker.slot)
+
+        self.diag.camera_index = self.cameras[0].index
+
+        # With one camera the detection worker feeds the control slot directly;
+        # with two, a fusion worker combines them into a fresh output slot.
+        if len(self.detections) > 1:
+            self.fusion = FusionWorker(
+                in_slots=self.det_slots,
+                out_slot=LatestSlot(),
+                fusion_cfg=self.fusion_cfg,
+                tick_hz=self.control_tick_hz,
+            )
+            self.control_slot = self.fusion.out_slot
+            self.logger.info("dual-camera fusion enabled (%d cameras, strategy=%s)",
+                             len(self.detections), self.fusion_cfg.strategy)
+        else:
+            self.control_slot = self.det_slots[0]
+
+    def _reconfigure_cameras(self) -> None:
+        """Apply pending camera/dual changes by rebuilding the detection layer
+        while the controller + control thread keep running (safety eases the
+        hand to rest during the brief camera reopen)."""
+        self.logger.info("reconfiguring cameras (dual=%s cam0=%s cam1=%s) ...",
+                         self.dual, self.cam0_index, self.cam1_index)
+        layer = list(self.detections) + ([self.fusion] if self.fusion else [])
+        for w in layer:
+            w.stop()
+        for w in layer:
+            if w.is_alive():
+                w.join(timeout=1.0)
+        for camera in self.cameras:
+            try:
+                camera.release()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("camera release error: %s", exc)
+        for w in self.detections:
+            try:
+                w.tracker.close()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("tracker close error: %s", exc)
+
+        try:
+            self._build_detection_layer()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("camera rebuild failed: %s; stopping", exc)
+            self._running = False
+            return
+
+        for w in self.detections:
+            w.start()
+        if self.fusion is not None:
+            self.fusion.start()
+        if self.control is not None:
+            self.control.set_slot(self.control_slot)
+        self.logger.info("reconfigure done (%d camera(s) active)", len(self.detections))
+
     def teardown(self) -> None:
         self.logger.info("shutting down; stopping workers and sending rest pose")
-        # Stop detection first so no new poses arrive, then stop control.
-        for worker in (self.detection, self.control):
-            if worker is not None:
-                worker.stop()
-        for worker in (self.detection, self.control):
-            if worker is not None and worker.is_alive():
+        # Stop detection first so no new poses arrive, then fusion, then control.
+        workers: List = list(self.detections)
+        if self.fusion is not None:
+            workers.append(self.fusion)
+        if self.control is not None:
+            workers.append(self.control)
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            if worker.is_alive():
                 worker.join(timeout=1.0)
 
         try:
@@ -226,16 +394,16 @@ class HandMimicApp:
                 self.controller.close()
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("controller shutdown error: %s", exc)
-        try:
-            if self.camera is not None:
-                self.camera.release()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("camera shutdown error: %s", exc)
-        try:
-            if self.tracker is not None:
-                self.tracker.close()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("tracker shutdown error: %s", exc)
+        for camera in self.cameras:
+            try:
+                camera.release()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("camera shutdown error: %s", exc)
+        for worker in self.detections:
+            try:
+                worker.tracker.close()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("tracker shutdown error: %s", exc)
         if self.show_window:
             try:
                 import cv2
@@ -250,10 +418,14 @@ class HandMimicApp:
     def run(self) -> None:
         self._running = True
         self.setup()
-        assert self.detection is not None and self.control is not None
-        self.detection.start()
+        assert self.control is not None
+        for worker in self.detections:
+            worker.start()
+        if self.fusion is not None:
+            self.fusion.start()
         self.control.start()
-        self.logger.info("entering main loop (workers running)")
+        self.logger.info("entering main loop (%d camera(s), workers running)",
+                         len(self.detections))
 
         deadline = (
             time.perf_counter() + self.benchmark_seconds
@@ -263,7 +435,10 @@ class HandMimicApp:
         last_report = 0.0
         try:
             while self._running:
-                if not self.detection.is_alive() or not self.control.is_alive():
+                alive = (all(w.is_alive() for w in self.detections)
+                         and self.control.is_alive()
+                         and (self.fusion is None or self.fusion.is_alive()))
+                if not alive:
                     self.logger.error("a worker thread died; exiting")
                     break
 
@@ -294,50 +469,134 @@ class HandMimicApp:
         """Pull the latest control + metrics state into the diagnostics snapshot."""
         self.diag.update_from_metrics(self.metrics.snapshot())
         if self.control is not None:
-            command, track_state, connected = self.control.status()
+            command, track_state, connected, handedness = self.control.status()
             self.diag.command = command
             self.diag.track_state = track_state
             self.diag.serial_connected = connected
+            self.diag.handedness = handedness
+            # Classify the commanded pose for the debug/headless hand-state view.
+            self.diag.hand_state = classify(command, handedness)
 
     def _render(self) -> None:
         import cv2
 
-        assert self.detection is not None and self.tracker is not None
-        frame, selected_hand, pose = self.detection.debug_snapshot()
-        if frame is None:
+        if not self.detections:
             time.sleep(0.005)
             return
 
         self._refresh_diag()
-        self.diag.selected = pose is not None
-        self.diag.handedness = pose.handedness if pose is not None else "-"
 
-        # Draw landmarks on the ORIGINAL (unmirrored) frame; the later flip then
-        # keeps the skeleton aligned with the mirrored selfie preview.
-        if (
-            selected_hand is not None
-            and self.debug_cfg.get("draw_landmarks", True)
-            and hasattr(self.tracker, "draw")
-        ):
-            try:
-                self.tracker.draw(frame, selected_hand)
-            except Exception as exc:  # noqa: BLE001 - drawing must never crash the demo
-                self.logger.debug("landmark draw failed: %s", exc)
+        # One panel per camera: landmarks + that camera's own raw weights.
+        panels: List = []
+        primary_pose = None
+        for i, worker in enumerate(self.detections):
+            frame, selected_hand, pose = worker.debug_snapshot()
+            if frame is None:
+                continue
+            if i == 0:
+                primary_pose = pose
+            # Draw landmarks on the ORIGINAL frame; the later flip keeps the
+            # skeleton aligned with the mirrored selfie preview.
+            if (selected_hand is not None
+                    and self.debug_cfg.get("draw_landmarks", True)
+                    and hasattr(worker.tracker, "draw")):
+                try:
+                    worker.tracker.draw(frame, selected_hand)
+                except Exception as exc:  # noqa: BLE001 - drawing must never crash the demo
+                    self.logger.debug("landmark draw failed: %s", exc)
+            disp = cv2.flip(frame, 1) if self.cam_cfg.mirror_preview else frame
+            self._annotate_camera_panel(disp, i, pose)
+            panels.append(disp)
 
-        display = cv2.flip(frame, 1) if self.cam_cfg.mirror_preview else frame
+        if not panels:
+            time.sleep(0.005)
+            return
+
+        # Dual requested but the 2nd camera isn't up: show a clear placeholder
+        # panel (instead of silently staying single) so it's visible on screen
+        # and you can pick a working index in the menu.
+        if self.dual and len(panels) < 2:
+            panels.append(self._placeholder_panel(panels[0]))
+
+        self.diag.selected = primary_pose is not None
+        if primary_pose is not None:
+            self.diag.handedness = primary_pose.handedness
+            self.diag.hand_state = classify(primary_pose.as_dict(), primary_pose.handedness)
+
+        # Side-by-side composite when more than one camera is active. The main
+        # overlay (fused command bars + gesture + metrics) is drawn over it.
+        display = panels[0] if len(panels) == 1 else self._hconcat(panels)
         draw_overlay(
             display,
             self.diag,
-            pose,
+            primary_pose,
             draw_curl_bars=self.debug_cfg.get("draw_curl_bars", True),
             draw_fps=self.debug_cfg.get("draw_fps", True),
         )
 
+        if not self.menu.visible:
+            hint_x = display.shape[1] - 96
+            cv2.putText(display, "[m] menu", (hint_x, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(display, "[m] menu", (hint_x, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 220), 1, cv2.LINE_AA)
+        self.menu.render(display)
         window = self.debug_cfg.get("window_name", "rb3_hand_mimic")
         cv2.imshow(window, display)
-        if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):  # ESC or q
+
+        key = cv2.waitKey(1) & 0xFF
+        action = self.menu.handle_key(key)
+        if action == "apply_cameras":
+            self._reconfigure_cameras()
+        elif action is None and key in (27, ord("q")):  # ESC/q (menu didn't consume)
             self.logger.info("quit requested from window")
             self._running = False
+
+    def _annotate_camera_panel(self, panel, i: int, pose) -> None:
+        """Label a camera panel and (in dual mode) print that camera's raw weights."""
+        import cv2
+
+        idx = self.cameras[i].index if i < len(self.cameras) else i
+        label = f"cam{i} (idx {idx})"
+        y0 = panel.shape[0] - 12
+        cv2.putText(panel, label, (8, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(panel, label, (8, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 1, cv2.LINE_AA)
+        if len(self.detections) > 1:
+            curls = pose.as_dict() if pose is not None else {f: 0.0 for f in FINGERS}
+            wtxt = "raw " + " ".join(f"{f[0].upper()}{curls.get(f, 0.0):.2f}" for f in FINGERS)
+            yw = panel.shape[0] - 32
+            cv2.putText(panel, wtxt, (8, yw), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(panel, wtxt, (8, yw), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def _placeholder_panel(self, ref):
+        """A 'camera unavailable' panel, shown when dual is on but cam1 isn't up."""
+        import cv2
+        import numpy as np
+
+        h, w = ref.shape[0], ref.shape[1]
+        panel = np.full((h, w, 3), 35, dtype=np.uint8)
+        idx = "auto" if self.cam1_index is None else str(self.cam1_index)
+        lines = [
+            f"cam1 (idx {idx}): UNAVAILABLE",
+            "open [m] menu -> set 'Camera 1 index'",
+            "-> 'APPLY camera changes' (Enter)",
+        ]
+        y = h // 2 - 24
+        for s in lines:
+            cv2.putText(panel, s, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 210), 2, cv2.LINE_AA)
+            y += 34
+        return panel
+
+    @staticmethod
+    def _hconcat(panels: List):
+        """Horizontally stack panels, normalizing to a common height."""
+        import cv2
+
+        h = min(p.shape[0] for p in panels)
+        resized = [
+            p if p.shape[0] == h
+            else cv2.resize(p, (int(p.shape[1] * h / p.shape[0]), h))
+            for p in panels
+        ]
+        return cv2.hconcat(resized)
 
     def stop(self) -> None:
         self._running = False

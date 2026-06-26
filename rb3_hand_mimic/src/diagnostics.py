@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from .gesture_mapper import HandPose
+from .gesture_recognizer import HandState
 from .utils import FINGERS, FpsMeter, get_logger
 
 log = get_logger("diag")
@@ -40,6 +41,9 @@ class Diagnostics:
     control_hz: float = 0.0
     detection_rate: float = 0.0
 
+    # Recognized hand state (handedness + gesture + per-finger states).
+    hand_state: Optional[HandState] = None
+
     def tick(self) -> None:
         self.fps_meter.tick()
         self.fps = self.fps_meter.fps()
@@ -60,13 +64,14 @@ class Diagnostics:
     # -- headless logging ---------------------------------------------------
     def status_line(self) -> str:
         cmd = " ".join(f"{f[0]}:{self.command.get(f, 0.0):.2f}" for f in FINGERS)
+        state = self.hand_state.summary() if self.hand_state else f"hand={self.handedness}"
         return (
             f"cam={self.camera_index} det={self.detect_fps:4.1f}fps "
             f"lat p50/p90={self.detect_p50_ms:4.1f}/{self.detect_p90_ms:4.1f}ms "
             f"e2e={self.e2e_p50_ms:5.1f}ms ctrl={self.control_hz:4.0f}hz "
-            f"hand={self.handedness} sel={'Y' if self.selected else 'N'} "
+            f"sel={'Y' if self.selected else 'N'} "
             f"hw={'up' if self.serial_connected else 'DOWN'} "
-            f"track={self.track_state} | {cmd}"
+            f"track={self.track_state} | {state} | {cmd}"
         )
 
 
@@ -99,22 +104,46 @@ def draw_overlay(
             f"e2e {diag.e2e_p50_ms:5.1f} ms   ctrl {diag.control_hz:4.0f} hz", 40, yellow)
 
     hw_color = green if diag.serial_connected else red
-    put(f"hand: {'connected' if diag.serial_connected else 'DISCONNECTED'}", 60, hw_color)
+    put(f"hand sdk: {'connected' if diag.serial_connected else 'DISCONNECTED'}", 60, hw_color)
 
-    track_color = green if diag.track_state == "active" else yellow
-    put(f"track: {diag.track_state}   hand: {diag.handedness}   sel: {'Y' if diag.selected else 'N'}", 80, track_color)
-
-    put(f"cam_mirror: {diag.camera_mirror}   out_mirror: {diag.output_mirror}", 100)
+    # Prominent handedness + gesture. LEFT is the Paxini target hand, so it is
+    # highlighted green; a right hand is shown amber as a hint to switch hands.
+    hs = diag.hand_state
+    handed = hs.handedness if hs else diag.handedness
+    gesture = hs.gesture if hs else "-"
+    if handed.lower().startswith("l"):
+        hand_txt, hand_col = "LEFT hand", green
+    elif handed.lower().startswith("r"):
+        hand_txt, hand_col = "RIGHT hand  (target is LEFT)", yellow
+    else:
+        hand_txt, hand_col = "no hand", red
+    cv2.putText(frame, hand_txt, (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(frame, hand_txt, (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hand_col, 1, cv2.LINE_AA)
+    put(f"gesture: {gesture}", 110, white)
+    put(f"track: {diag.track_state}   sel: {'Y' if diag.selected else 'N'}   "
+        f"cam_mirror: {diag.camera_mirror}  out_mirror: {diag.output_mirror}", 130, yellow)
 
     if draw_curl_bars:
-        _draw_curl_bars(frame, diag.command, origin_y=h - 110)
+        states = {f.name: f.state for f in hs.fingers} if hs else {}
+        _draw_curl_bars(frame, diag.command, origin_y=h - 120, finger_states=states)
 
     return frame
 
 
-def _draw_curl_bars(frame, command: Dict[str, float], origin_y: int) -> None:
+# Per-finger state -> bar annotation color (BGR).
+_STATE_COLOR = {
+    "extended": (0, 220, 0),
+    "half": (0, 220, 220),
+    "bent": (0, 120, 255),
+}
+_STATE_TAG = {"extended": "ext", "half": "half", "bent": "bent"}
+
+
+def _draw_curl_bars(frame, command: Dict[str, float], origin_y: int,
+                    finger_states: Optional[Dict[str, str]] = None) -> None:
     import cv2
 
+    finger_states = finger_states or {}
     bar_w = 26
     gap = 10
     max_h = 80
@@ -137,6 +166,12 @@ def _draw_curl_bars(frame, command: Dict[str, float], origin_y: int) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(frame, f"{val:.2f}", (x - 2, origin_y - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        # per-finger discrete state tag (extended / half / bent)
+        st = finger_states.get(finger)
+        if st:
+            cv2.putText(frame, _STATE_TAG.get(st, st), (x - 4, origin_y + max_h + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                        _STATE_COLOR.get(st, (255, 255, 255)), 1, cv2.LINE_AA)
         x += bar_w + gap
 
 

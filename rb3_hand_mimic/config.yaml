@@ -27,6 +27,28 @@ camera:
   avoid_indices: []       # e.g. [0] to skip the main camera during auto-select
 
 # -----------------------------------------------------------------------------
+# CAMERA 2 (optional second view for fusion)
+# -----------------------------------------------------------------------------
+# A second camera mounted beside the first (in series, at a fixed baseline) sees
+# fingers the first view occludes. When enabled, each camera runs its own
+# detection and the per-finger curls are fused (see `fusion`). Inherits the
+# settings above except the keys overridden here. Off by default -> the standard
+# pipeline stays single-camera, lightweight, and fast.
+camera2:
+  enabled: false          # true, or pass --camera2-index N, to turn on fusion
+  index: 1                # /dev/video index (or "auto") of the second camera
+  # baseline_mm is informational for now (documents the rig spacing); it will
+  # matter once fusion uses geometry rather than just per-finger confidence.
+  baseline_mm: 60
+
+# -----------------------------------------------------------------------------
+# FUSION (how the two cameras' per-finger weights are combined)
+# -----------------------------------------------------------------------------
+fusion:
+  strategy: "confidence_weighted"  # placeholder: per-source detection-score avg
+  min_confidence: 0.3              # ignore a camera below this hand score
+
+# -----------------------------------------------------------------------------
 # TRACKER (hand landmark detection)
 # -----------------------------------------------------------------------------
 tracker:
@@ -69,12 +91,16 @@ calibration:
   file: "calibration.yaml"    # written by record_calibration.py (relative to config)
   # Fallback ranges used when no calibration file exists. raw_open should map
   # to curl 0.0, raw_closed to curl 1.0. These are conservative defaults.
+  # "closed" is set to a NATURAL (comfortable) close, not a maximal fist, so a
+  # relaxed close reaches 1.0 and a half-bend reads ~0.5. Lower "closed" further
+  # if your full close still doesn't reach 1.0; raise it if it saturates too
+  # early. Per-user `record_calibration.py` is the precise fix.
   defaults:
-    thumb:  { open: 0.15, closed: 0.80 }
-    index:  { open: 0.10, closed: 0.90 }
-    middle: { open: 0.10, closed: 0.90 }
-    ring:   { open: 0.10, closed: 0.90 }
-    pinky:  { open: 0.10, closed: 0.90 }
+    thumb:  { open: 0.08, closed: 0.74 }
+    index:  { open: 0.08, closed: 0.84 }
+    middle: { open: 0.08, closed: 0.84 }
+    ring:   { open: 0.08, closed: 0.84 }
+    pinky:  { open: 0.08, closed: 0.84 }
   # Minimum separation between open and closed raw values to be considered valid.
   min_separation: 0.15
 
@@ -82,13 +108,15 @@ calibration:
 # SMOOTHING
 # -----------------------------------------------------------------------------
 smoothing:
-  filter: "ema"        # "ema" | "one_euro" | "none"
-  ema_alpha: 0.5       # 0..1 ; higher = more responsive, lower = smoother
-  deadband: 0.02       # ignore changes smaller than this (anti-jitter)
-  # One Euro filter params (used when filter == "one_euro")
+  # One Euro adapts: heavy smoothing when the hand is still (kills jitter), but
+  # it opens up and tracks with little lag during fast motion -- the best fit
+  # for "responsive to sudden movement AND sensitive to small changes".
+  filter: "one_euro"   # "one_euro" | "ema" | "none"
+  ema_alpha: 0.6       # only used when filter == "ema"
+  deadband: 0.008      # tiny: One Euro handles jitter, so keep small moves
   one_euro:
-    min_cutoff: 1.0
-    beta: 0.02
+    min_cutoff: 1.7    # lower = smoother at rest / more lag on slow moves
+    beta: 0.55         # higher = follows fast motion more aggressively
     d_cutoff: 1.0
 
 # -----------------------------------------------------------------------------
@@ -104,8 +132,10 @@ safety:
   # Watchdog: if no fresh pose for this long, force return-to-rest.
   watchdog_seconds: 1.5
   # Maximum per-command change per finger (rate limit, units = curl 0..1).
-  # Prevents servo slamming. Set high (e.g. 1.0) to disable.
-  max_step_per_command: 0.25
+  # Prevents servo slamming but also caps how fast the output can chase a quick
+  # gesture. At command_rate_hz=30 a value of 0.5 = full 0->1 in ~66 ms. Raise
+  # toward 1.0 for maximum responsiveness (less hardware protection).
+  max_step_per_command: 0.5
 
 # -----------------------------------------------------------------------------
 # PIPELINE (async detection <-> control)
@@ -132,7 +162,13 @@ hand:
   # "mock"   -> logs commands only (also forced by --dry-run).
   controller: "sdk"
   sdk:
-    library: "placeholder"   # "placeholder" | <name of the ARM64 SDK binding>
+    library: "dexh15"        # "dexh15" (Paxini) | "placeholder" | <ARM64 binding>
+  # DexH15 (Paxini) bridge: this app runs on the RB3 (ARM64) and ships 11 joint
+  # angles [0..1000] to the DexH15 C++ SDK running inside an x86 VM, which calls
+  # setJointPositionsAngle(). Placeholder until the bridge process exists.
+  dexh15:
+    host: "127.0.0.1"        # x86 VM address reachable from the RB3
+    port: 50515
   port: "auto"             # (serial) "auto" or explicit, e.g. "/dev/ttyACM0"
   baudrate: 115200
   timeout: 0.02            # write/read timeout seconds (keep small, non-blocking)

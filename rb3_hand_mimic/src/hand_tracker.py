@@ -25,7 +25,12 @@ log = get_logger("tracker")
 class HandLandmarks:
     """A single detected hand.
 
-    points: (21, 3) array of normalized landmarks (x, y in [0,1], z relative).
+    points: (21, 3) array of normalized image landmarks (x, y in [0,1], z rel).
+    world_points: (21, 3) metric, view-normalized landmarks in meters relative
+        to the hand's geometric center (MediaPipe `hand_world_landmarks`). These
+        are far more robust than image landmarks for joint-angle/curl estimation
+        because they don't change as the hand rotates or moves in frame. May be
+        None if the backend doesn't provide them.
     handedness: "Left" or "Right" as reported by the tracker (image space).
     score: detection/handedness confidence in [0, 1].
     bbox: (x_min, y_min, x_max, y_max) in normalized coords.
@@ -35,6 +40,7 @@ class HandLandmarks:
     handedness: str
     score: float
     bbox: Tuple[float, float, float, float]
+    world_points: Optional[np.ndarray] = None
 
     def area(self) -> float:
         x0, y0, x1, y1 = self.bbox
@@ -203,9 +209,14 @@ class MediaPipeHandTracker(BaseHandTracker):
 
         out: List[HandLandmarks] = []
         hand_landmarks = result.hand_landmarks or []
+        world_landmarks = result.hand_world_landmarks or []
         handedness = result.handedness or []
         for i, lm_list in enumerate(hand_landmarks):
             pts = np.array([[p.x, p.y, p.z] for p in lm_list], dtype=np.float32)
+            world = None
+            if i < len(world_landmarks) and world_landmarks[i]:
+                world = np.array([[p.x, p.y, p.z] for p in world_landmarks[i]],
+                                 dtype=np.float32)
             label = "Unknown"
             score = 1.0
             if i < len(handedness) and handedness[i]:
@@ -214,7 +225,8 @@ class MediaPipeHandTracker(BaseHandTracker):
                 score = float(cat.score)
             xs, ys = pts[:, 0], pts[:, 1]
             bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
-            out.append(HandLandmarks(points=pts, handedness=label, score=score, bbox=bbox))
+            out.append(HandLandmarks(points=pts, handedness=label, score=score,
+                                     bbox=bbox, world_points=world))
         return out
 
     def draw(self, frame_bgr: np.ndarray, hand: HandLandmarks) -> None:

@@ -49,6 +49,7 @@ class HandConfig:
     servo_max: int = 180
     decimals: int = 3
     sdk_library: str = "placeholder"   # which HandSdk binding to load (sdk backend)
+    dexh15: Dict = field(default_factory=dict)  # DexH15 bridge settings (host/port)
     rest_pose: Dict[str, float] = field(
         default_factory=lambda: {f: 0.0 for f in FINGERS}
     )
@@ -70,6 +71,7 @@ class HandConfig:
             servo_max=int(d.get("servo_max", 180)),
             decimals=int(d.get("decimals", 3)),
             sdk_library=str(sdk.get("library", "placeholder")),
+            dexh15=dict(d.get("dexh15", {}) or {}),
             rest_pose={f: float(rest.get(f, 0.0)) for f in FINGERS},
         )
 
@@ -389,9 +391,11 @@ def load_hand_sdk(cfg: HandConfig, finger_order: Optional[List[str]] = None) -> 
     lib = (cfg.sdk_library or "placeholder").lower()
     if lib in ("placeholder", "", "mock", "none"):
         return PlaceholderHandSdk(finger_order)
-    # TODO(vng-paxini-arm64): import and construct the real binding here, e.g.
-    #   from paxini_arm64 import PaxiniHand
-    #   return PaxiniHandSdkAdapter(PaxiniHand(...))
+    if lib in ("dexh15", "paxini", "paxini_dexh15"):
+        # Paxini DexH15: maps curls -> 11 joints and bridges to the x86-VM SDK.
+        from .dexh15_sdk import DexH15Config, DexH15HandSdk
+        return DexH15HandSdk(DexH15Config.from_dict(cfg.dexh15), finger_order)
+    # TODO(vng-paxini-arm64): import and construct any other real binding here.
     log.warning(
         "hand.sdk.library=%r requested but no ARM64 binding is wired in yet; "
         "falling back to PlaceholderHandSdk.", cfg.sdk_library,
