@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .fusion import FusionConfig, fuse_curls
+from .gesture_mapper import compute_finger_confidence
 from .metrics import Metrics
 from .utils import get_logger
 
@@ -62,6 +63,7 @@ class PoseSample:
     handedness: str = ""
     confidence: float = 0.0
     values: Optional[Dict[str, float]] = None
+    finger_conf: Optional[Dict[str, float]] = None  # per-finger view reliability
 
 
 class LatestSlot:
@@ -145,11 +147,13 @@ class DetectionWorker(threading.Thread):
             hand = self.tracker.select_best(hands, self.tracker_cfg)
 
             pose = None
+            finger_conf = None
             if hand is not None:
                 raw = self.mapper.map(hand)
                 norm = self.calibration.normalize(raw)
                 tf = self.transform.apply(norm)
                 pose = self.smoother.apply(tf)
+                finger_conf = compute_finger_confidence(hand)
             detect_ts = time.perf_counter()
 
             sample = PoseSample(
@@ -160,6 +164,7 @@ class DetectionWorker(threading.Thread):
                 handedness=pose.handedness if pose is not None else "",
                 confidence=pose.confidence if pose is not None else 0.0,
                 values=pose.as_dict() if pose is not None else None,
+                finger_conf=finger_conf,
             )
             self.slot.put(sample)
             self.metrics.record_detection((detect_ts - t0) * 1000.0, hand is not None)
@@ -302,7 +307,7 @@ class FusionWorker(threading.Thread):
                 confidence = 0.0
                 for sample, _ in fetched:
                     if sample is not None and sample.detected and sample.values:
-                        sources.append((sample.values, sample.confidence))
+                        sources.append((sample.values, sample.confidence, sample.finger_conf))
                         # Carry timestamps/handedness from the freshest detection.
                         if sample.detect_ts > detect_ts:
                             detect_ts = sample.detect_ts
@@ -310,7 +315,7 @@ class FusionWorker(threading.Thread):
                             handedness = sample.handedness
                             confidence = sample.confidence
                     else:
-                        sources.append((None, 0.0))
+                        sources.append((None, 0.0, None))
 
                 fused = fuse_curls(sources, self.fusion_cfg)
                 now = time.perf_counter()

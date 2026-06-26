@@ -164,29 +164,85 @@ def _thumb_curl(pts: np.ndarray) -> float:
     return clamp(THUMB_W_FLEX * flex + THUMB_W_ADD * add, 0.0, 1.0)
 
 
-def compute_raw_curls(pts: np.ndarray) -> Dict[str, float]:
-    """Compute raw (un-calibrated) curl values for all five fingers.
+_FINGER_IDX = {
+    "thumb": THUMB, "index": INDEX, "middle": MIDDLE, "ring": RING, "pinky": PINKY,
+}
 
-    `pts` is a (21, 3) landmark array -- pass world landmarks when available for
-    orientation-invariant results.
+
+def _curl_one(pts: np.ndarray, name: str) -> float:
+    """Curl for one finger from a single landmark array (2D or 3D)."""
+    if name == "thumb":
+        return _thumb_curl(pts)
+    return _finger_curl_4pt(pts, _FINGER_IDX[name])
+
+
+def compute_raw_curls(hand) -> Dict[str, float]:
+    """Per-finger raw curl, blending an in-plane 2D-image estimate with the 3D
+    world estimate by how well each finger is seen in the image.
+
+    Why blend: the 2D image landmarks are crisp and reliable for a finger bent
+    *within* the image plane -- e.g. a 90-degree bend at the PIP ("hook"), which
+    the 3D world model tends to under-rotate, especially for a single finger bent
+    on its own. So when a finger is seen side-on (high view confidence) we trust
+    the 2D angle; when it is foreshortened (pointing toward/away from the camera)
+    we fall back to the orientation-robust 3D estimate.
     """
-    return {
-        "thumb": _thumb_curl(pts),
-        "index": _finger_curl_4pt(pts, INDEX),
-        "middle": _finger_curl_4pt(pts, MIDDLE),
-        "ring": _finger_curl_4pt(pts, RING),
-        "pinky": _finger_curl_4pt(pts, PINKY),
-    }
+    world = hand.world_points if hand.world_points is not None else hand.points
+    img = hand.points
+    aspect = float(getattr(hand, "aspect", 1.0)) or 1.0
+
+    # In-plane 2D copy: de-stretch normalized x and flatten z into the image plane.
+    img2d = np.asarray(img, dtype=np.float32).copy()
+    img2d[:, 0] *= aspect
+    img2d[:, 2] = 0.0
+
+    conf = compute_finger_confidence(hand)  # per-finger "seen side-on" weight
+    out: Dict[str, float] = {}
+    for name in FINGERS:
+        w = clamp(conf.get(name, 0.0), 0.0, 1.0)
+        curl_2d = _curl_one(img2d, name)
+        curl_3d = _curl_one(world, name)
+        out[name] = clamp(w * curl_2d + (1.0 - w) * curl_3d, 0.0, 1.0)
+    return out
+
+
+def _path_len(pts: np.ndarray, idx: tuple, dims: int) -> float:
+    """Summed length of the landmark chain `idx`, using the first `dims` coords."""
+    total = 0.0
+    for k in range(len(idx) - 1):
+        total += float(np.linalg.norm(pts[idx[k + 1]][:dims] - pts[idx[k]][:dims]))
+    return total
+
+
+def compute_finger_confidence(hand) -> Dict[str, float]:
+    """Per-finger view reliability in [0, 1] from image-vs-world foreshortening.
+
+    Each finger's chain length is measured in the 2D image and in 3D world
+    space, both normalized by palm width. When a finger lies in the image plane
+    (seen side-on) the two match -> confidence ~1. When it points toward/away
+    from the camera -- exactly what a curling finger does when the PALM faces the
+    lens -- the image projection shrinks -> low confidence. Multi-camera fusion
+    uses this to trust whichever camera sees each finger side-on.
+    """
+    img = hand.points
+    world = hand.world_points if hand.world_points is not None else hand.points
+    palm_img = float(np.linalg.norm(img[INDEX_MCP][:2] - img[PINKY_MCP][:2])) + 1e-6
+    palm_world = float(np.linalg.norm(world[INDEX_MCP] - world[PINKY_MCP])) + 1e-6
+    conf: Dict[str, float] = {}
+    for name, idx in _FINGER_IDX.items():
+        ext_img = _path_len(img, idx, 2) / palm_img
+        ext_world = _path_len(world, idx, 3) / palm_world
+        conf[name] = clamp(ext_img / (ext_world + 1e-6), 0.0, 1.0)
+    return conf
 
 
 class GestureMapper:
     """Stateless mapper from landmarks to raw HandPose (pre-calibration)."""
 
     def map(self, hand: HandLandmarks) -> HandPose:
-        # World landmarks are metric and orientation-normalized, giving far more
-        # consistent curls across hand angles; fall back to image landmarks.
-        pts = hand.world_points if hand.world_points is not None else hand.points
-        raw = compute_raw_curls(pts)
+        # Per-finger blend of 2D-image and 3D-world curl (see compute_raw_curls):
+        # accurate for in-plane bends, orientation-robust when foreshortened.
+        raw = compute_raw_curls(hand)
         return HandPose(
             thumb=raw["thumb"],
             index=raw["index"],

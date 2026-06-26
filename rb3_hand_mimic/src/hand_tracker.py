@@ -41,6 +41,7 @@ class HandLandmarks:
     score: float
     bbox: Tuple[float, float, float, float]
     world_points: Optional[np.ndarray] = None
+    aspect: float = 1.0   # source frame width/height, to de-stretch 2D x coords
 
     def area(self) -> float:
         x0, y0, x1, y1 = self.bbox
@@ -207,6 +208,8 @@ class MediaPipeHandTracker(BaseHandTracker):
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         result = self._landmarker.detect_for_video(mp_image, self._next_timestamp_ms())
 
+        h, w = frame_bgr.shape[:2]
+        aspect = (w / h) if h else 1.0
         out: List[HandLandmarks] = []
         hand_landmarks = result.hand_landmarks or []
         world_landmarks = result.hand_world_landmarks or []
@@ -226,7 +229,7 @@ class MediaPipeHandTracker(BaseHandTracker):
             xs, ys = pts[:, 0], pts[:, 1]
             bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
             out.append(HandLandmarks(points=pts, handedness=label, score=score,
-                                     bbox=bbox, world_points=world))
+                                     bbox=bbox, world_points=world, aspect=aspect))
         return out
 
     def draw(self, frame_bgr: np.ndarray, hand: HandLandmarks) -> None:

@@ -102,9 +102,15 @@ def _backend_candidates(backend: str) -> List[int]:
         return [cv2.CAP_V4L2]
     if b == "gstreamer":
         return [cv2.CAP_GSTREAMER]
+    if b == "dshow":
+        return [cv2.CAP_DSHOW]
     # auto / any (and any unknown value): platform-aware with graceful fallback.
     if sys.platform.startswith("linux"):
         return [cv2.CAP_V4L2, cv2.CAP_ANY]
+    if sys.platform == "win32":
+        # CAP_DSHOW (DirectShow) opens a webcam in ~1-2s; the default MSMF
+        # backend can take ~15-20s on Windows. Try it first, fall back to ANY.
+        return [cv2.CAP_DSHOW, cv2.CAP_ANY]
     return [cv2.CAP_ANY]
 
 

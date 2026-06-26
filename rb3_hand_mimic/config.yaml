@@ -14,11 +14,14 @@
 # a fallback/debug source.
 camera:
   preferred: "tracking"   # "tracking" | "main" | "any" -- hint for auto-select
-  index: "auto"           # "auto" or an integer (e.g. 2). "auto" runs discovery.
+  # Explicit index = instant start. "auto" probes indexes 0-8 (each a camera
+  # open) which is slow on Windows, so we default to 0 here; set "auto" on the
+  # RB3 if you want it to discover the tracking camera.
+  index: 0                # "auto" or an integer (e.g. 2)
+  backend: "auto"         # "auto" | "dshow" (fast on Windows) | "v4l2" | "gstreamer"
   width: 640
   height: 480
   fps: 30                 # try 30 @ 640x480, or 60 @ 320x240 (see README tuning)
-  backend: "auto"         # "auto" | "v4l2" | "gstreamer" | "any"
   mirror_preview: true    # flip the *preview* horizontally (selfie view)
   rotate_degrees: 0       # 0 | 90 | 180 | 270 -- physical camera mounting
   buffer_size: 1          # keep at 1: latest-frame-only, low latency
@@ -35,7 +38,7 @@ camera:
 # settings above except the keys overridden here. Off by default -> the standard
 # pipeline stays single-camera, lightweight, and fast.
 camera2:
-  enabled: false          # true, or pass --camera2-index N, to turn on fusion
+  enabled: true           # both cameras on by default; fusion always active
   index: 1                # /dev/video index (or "auto") of the second camera
   # baseline_mm is informational for now (documents the rig spacing); it will
   # matter once fusion uses geometry rather than just per-finger confidence.
@@ -108,15 +111,18 @@ calibration:
 # SMOOTHING
 # -----------------------------------------------------------------------------
 smoothing:
-  # One Euro adapts: heavy smoothing when the hand is still (kills jitter), but
-  # it opens up and tracks with little lag during fast motion -- the best fit
-  # for "responsive to sudden movement AND sensitive to small changes".
+  # One Euro adapts: heavy smoothing when a finger is still (kills the per-finger
+  # estimation jitter that otherwise makes a STILL finger twitch when a different
+  # finger moves), but it opens up and tracks with little lag during real motion.
   filter: "one_euro"   # "one_euro" | "ema" | "none"
   ema_alpha: 0.6       # only used when filter == "ema"
-  deadband: 0.008      # tiny: One Euro handles jitter, so keep small moves
+  # deadband freezes sub-threshold changes so a still finger holds rock-steady
+  # while another finger moves. Raise if still fingers wobble; lower for more
+  # sensitivity to tiny moves.
+  deadband: 0.02
   one_euro:
-    min_cutoff: 1.7    # lower = smoother at rest / more lag on slow moves
-    beta: 0.55         # higher = follows fast motion more aggressively
+    min_cutoff: 1.0    # LOWER = steadier when still (less cross-talk jitter)
+    beta: 0.8          # HIGHER = still snaps to genuine fast motion
     d_cutoff: 1.0
 
 # -----------------------------------------------------------------------------

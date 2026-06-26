@@ -29,6 +29,7 @@ import argparse
 import os
 import signal
 import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -44,7 +45,7 @@ from src.camera import (  # noqa: E402
 )
 from src.debug_menu import DebugMenu, MenuItem  # noqa: E402
 from src.diagnostics import Diagnostics, HeadlessReporter, draw_overlay  # noqa: E402
-from src.gesture_mapper import GestureMapper  # noqa: E402
+from src.gesture_mapper import GestureMapper, compute_finger_confidence  # noqa: E402
 from src.gesture_recognizer import classify  # noqa: E402
 from src.hand_controller import (  # noqa: E402
     BaseHandController,
@@ -291,20 +292,41 @@ class HandMimicApp:
         if self.dual:
             specs.append((self.cam1_index, self.cam2_cfg))
 
-        for i, (forced_index, cam_cfg) in enumerate(specs):
+        # Open the cameras in PARALLEL -- the slow part on Windows is the device
+        # open (a non-DirectShow webcam falls back to MSMF at ~10s), so opening
+        # both at once makes boot ~= the slowest single camera, not the sum.
+        # Trackers are created serially afterwards (MediaPipe's first-run TFLite
+        # init isn't safe to trigger from two threads at once).
+        cams: List = [None] * len(specs)
+
+        def _open(slot_i: int, forced_index, cam_cfg) -> None:
             try:
                 camera = open_camera_from_config(cam_cfg, forced_index)
                 camera.start()
+                cams[slot_i] = camera
             except Exception as exc:  # noqa: BLE001
-                if i == 0:
-                    raise  # primary camera is required
+                cams[slot_i] = exc
+
+        threads = [
+            threading.Thread(target=_open, args=(i, fi, cfg), name=f"cam-open-{i}")
+            for i, (fi, cfg) in enumerate(specs)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for i, camera in enumerate(cams):
+            if not isinstance(camera, Camera):
+                if i == 0:  # primary camera is required
+                    raise camera if isinstance(camera, BaseException) else RuntimeError(
+                        "primary camera failed to open")
                 self.logger.warning("secondary camera unavailable (%s); "
-                                    "continuing single-camera", exc)
-                break
-            tracker = create_tracker(self.tracker_cfg)
+                                    "continuing single-camera", camera)
+                continue
             worker = DetectionWorker(
                 camera=camera,
-                tracker=tracker,
+                tracker=create_tracker(self.tracker_cfg),
                 mapper=self.mapper,
                 calibration=self.calibration,
                 transform=Transform(self.transform_cfg),
@@ -505,7 +527,8 @@ class HandMimicApp:
                 except Exception as exc:  # noqa: BLE001 - drawing must never crash the demo
                     self.logger.debug("landmark draw failed: %s", exc)
             disp = cv2.flip(frame, 1) if self.cam_cfg.mirror_preview else frame
-            self._annotate_camera_panel(disp, i, pose)
+            conf = compute_finger_confidence(selected_hand) if selected_hand is not None else None
+            self._annotate_camera_panel(disp, i, pose, conf)
             panels.append(disp)
 
         if not panels:
@@ -550,8 +573,10 @@ class HandMimicApp:
             self.logger.info("quit requested from window")
             self._running = False
 
-    def _annotate_camera_panel(self, panel, i: int, pose) -> None:
-        """Label a camera panel and (in dual mode) print that camera's raw weights."""
+    def _annotate_camera_panel(self, panel, i: int, pose, conf=None) -> None:
+        """Label a camera panel and (in dual mode) print that camera's raw weights
+        and per-finger view confidence (higher = this camera sees that finger
+        better, so fusion trusts it more)."""
         import cv2
 
         idx = self.cameras[i].index if i < len(self.cameras) else i
@@ -561,10 +586,12 @@ class HandMimicApp:
         cv2.putText(panel, label, (8, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 1, cv2.LINE_AA)
         if len(self.detections) > 1:
             curls = pose.as_dict() if pose is not None else {f: 0.0 for f in FINGERS}
-            wtxt = "raw " + " ".join(f"{f[0].upper()}{curls.get(f, 0.0):.2f}" for f in FINGERS)
-            yw = panel.shape[0] - 32
-            cv2.putText(panel, wtxt, (8, yw), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(panel, wtxt, (8, yw), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            wtxt = "raw  " + " ".join(f"{f[0].upper()}{curls.get(f, 0.0):.2f}" for f in FINGERS)
+            ctxt = "conf " + " ".join(f"{f[0].upper()}{(conf or {}).get(f, 0.0):.2f}" for f in FINGERS)
+            cv2.putText(panel, wtxt, (8, panel.shape[0] - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(panel, wtxt, (8, panel.shape[0] - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(panel, ctxt, (8, panel.shape[0] - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(panel, ctxt, (8, panel.shape[0] - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 220, 120), 1, cv2.LINE_AA)
 
     def _placeholder_panel(self, ref):
         """A 'camera unavailable' panel, shown when dual is on but cam1 isn't up."""
