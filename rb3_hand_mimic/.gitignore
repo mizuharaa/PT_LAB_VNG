@@ -1,0 +1,21 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# pyright / mypy caches
+.pyright/
+.mypy_cache/
+
+# Runtime / debug artifacts
+debug_frames/
+*.log
+calibration.yaml
+
+# MediaPipe model bundle (downloaded; ~7.8 MB)
+models/*.task

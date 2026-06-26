@@ -30,10 +30,16 @@ camera:
 # TRACKER (hand landmark detection)
 # -----------------------------------------------------------------------------
 tracker:
-  backend: "mediapipe"        # "mediapipe" (only one shipped today; pluggable)
+  backend: "mediapipe"        # "mediapipe" (Tasks HandLandmarker; pluggable)
+  # Path to the MediaPipe Tasks hand model (.task), relative to the project root.
+  # Download once (~7.8 MB):
+  #   curl -L --create-dirs -o models/hand_landmarker.task \
+  #     https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+  model_path: "models/hand_landmarker.task"
   max_num_hands: 2
-  model_complexity: 0         # 0 = fastest (default), 1 = more accurate
+  model_complexity: 0         # legacy/no-op: the .task model fixes the network
   min_detection_confidence: 0.6
+  min_presence_confidence: 0.5
   min_tracking_confidence: 0.5
   # Hand selection when multiple hands are visible:
   select: "largest"           # "largest" | "left" | "right"
@@ -102,15 +108,36 @@ safety:
   max_step_per_command: 0.25
 
 # -----------------------------------------------------------------------------
+# PIPELINE (async detection <-> control)
+# -----------------------------------------------------------------------------
+# Detection (camera -> landmarks -> curls) runs on its own thread and never
+# waits on hand control. The control thread consumes the latest pose and drives
+# the hand SDK/serial. This keeps tracking responsive even when the hand SDK is
+# slow, blocking, or (today) a placeholder because the real SDK is x86-only.
+pipeline:
+  control_tick_hz: 120       # how often the control thread re-checks safety/watchdog
+  metrics_window: 150        # samples kept for latency percentiles (p50/p90/p99)
+  benchmark_report_seconds: 1.0  # how often --benchmark prints a progress line
+
+# -----------------------------------------------------------------------------
 # HAND (robotic hand controller)  --  Paxini protocol is configurable
 # -----------------------------------------------------------------------------
 hand:
-  controller: "serial"     # "serial" | "mock"   (--dry-run forces "mock")
-  port: "auto"             # "auto" or explicit, e.g. "/dev/ttyACM0"
+  # "sdk"    -> drive the robotic hand through the vendor SDK (HandSdk). The real
+  #            VNG x Paxini SDK is x86-only today and not yet ported to the RB3
+  #            (aarch64), so this currently uses PlaceholderHandSdk: it logs
+  #            commands and runs on any architecture. Swap in the real binding
+  #            via hand.sdk.library once the ARM64 SDK is available.
+  # "serial" -> text protocol over a serial/USB port (pyserial).
+  # "mock"   -> logs commands only (also forced by --dry-run).
+  controller: "sdk"
+  sdk:
+    library: "placeholder"   # "placeholder" | <name of the ARM64 SDK binding>
+  port: "auto"             # (serial) "auto" or explicit, e.g. "/dev/ttyACM0"
   baudrate: 115200
   timeout: 0.02            # write/read timeout seconds (keep small, non-blocking)
   command_rate_hz: 30      # cap outgoing command frequency
-  protocol: "csv"          # "csv" | "labeled_csv" | "json"
+  protocol: "csv"          # (serial) "csv" | "labeled_csv" | "json"
   newline: true            # append "\n" to each command
   value_type: "normalized" # "normalized" (0..1) | "servo" (servo_min..servo_max)
   servo_min: 0

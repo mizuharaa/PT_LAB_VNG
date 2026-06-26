@@ -14,6 +14,7 @@ import glob
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -85,18 +86,40 @@ class CameraInfo:
 # -----------------------------------------------------------------------------
 # Backend helpers
 # -----------------------------------------------------------------------------
-def _backend_flag(backend: str) -> int:
-    """Translate a config backend string to an OpenCV API preference."""
+def _backend_candidates(backend: str) -> List[int]:
+    """Ordered OpenCV backend flags to try for a config backend string.
+
+    Explicit choices ("v4l2"/"gstreamer") are honored exactly. "auto"/"any"
+    stays portable across architectures and OSes:
+      * Linux (x86_64 *and* aarch64/RB3): try V4L2 first (USB/UVC webcams), then
+        fall back to CAP_ANY -- which lets OpenCV reach a GStreamer/MIPI sensor
+        when V4L2 cannot open it, instead of hard-failing.
+      * Other OSes (Windows/macOS used for dev): CAP_ANY only. V4L2 does not
+        exist off Linux, so we must not force it on bare "posix" (e.g. macOS).
+    """
     b = (backend or "auto").lower()
     if b == "v4l2":
-        return cv2.CAP_V4L2
+        return [cv2.CAP_V4L2]
     if b == "gstreamer":
-        return cv2.CAP_GSTREAMER
-    if b in ("any", "auto"):
-        # On Linux V4L2 is the most reliable for USB/MIPI UVC cameras; on other
-        # platforms fall back to ANY so this stays cross-platform for dev.
-        return cv2.CAP_V4L2 if os.name == "posix" else cv2.CAP_ANY
-    return cv2.CAP_ANY
+        return [cv2.CAP_GSTREAMER]
+    # auto / any (and any unknown value): platform-aware with graceful fallback.
+    if sys.platform.startswith("linux"):
+        return [cv2.CAP_V4L2, cv2.CAP_ANY]
+    return [cv2.CAP_ANY]
+
+
+def _open_capture(index: int, backend: str) -> Optional["cv2.VideoCapture"]:
+    """Open a VideoCapture, trying each candidate backend in order.
+
+    Returns an opened capture, or None if every backend failed. Centralizes the
+    cross-platform backend fallback so probe/open/debug-frame behave identically.
+    """
+    for api in _backend_candidates(backend):
+        cap = cv2.VideoCapture(index, api)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return None
 
 
 def list_video_devices() -> List[str]:
@@ -170,12 +193,9 @@ def probe_camera(
     name: str = "",
 ) -> CameraInfo:
     """Open a camera index, attempt to read frames, and estimate FPS."""
-    api = _backend_flag(backend)
-    cap = cv2.VideoCapture(index, api)
-    device = f"/dev/video{index}" if os.name == "posix" else f"index {index}"
-
-    if not cap.isOpened():
-        cap.release()
+    device = f"/dev/video{index}" if sys.platform.startswith("linux") else f"index {index}"
+    cap = _open_capture(index, backend)
+    if cap is None:
         return CameraInfo(index, False, False, 0, 0, 0.0, device, name, "did not open")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -245,7 +265,9 @@ def discover_cameras(
 
 
 def _save_debug_frame(index: int, cfg: CameraConfig, out_dir: str, name: str) -> None:
-    cap = cv2.VideoCapture(index, _backend_flag(cfg.backend))
+    cap = _open_capture(index, cfg.backend)
+    if cap is None:
+        return
     try:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
@@ -323,9 +345,8 @@ class Camera:
 
     # -- lifecycle ----------------------------------------------------------
     def open(self) -> None:
-        api = _backend_flag(self.cfg.backend)
-        cap = cv2.VideoCapture(self.index, api)
-        if not cap.isOpened():
+        cap = _open_capture(self.index, self.cfg.backend)
+        if cap is None:
             raise RuntimeError(
                 f"Could not open camera index {self.index}.\n"
                 "Hints: run `python tools/discover_cameras.py`, check that the "
@@ -387,7 +408,7 @@ class Camera:
                 self._frame_id += 1
                 self._last_capture_ts = time.perf_counter()
 
-    def read(self) -> Tuple[Optional["cv2.Mat"], int]:
+    def read(self) -> Tuple[Optional["cv2.typing.MatLike"], int]:
         """Return (latest_frame_copy_ref, frame_id). frame may be None early on."""
         with self._lock:
             return self._frame, self._frame_id

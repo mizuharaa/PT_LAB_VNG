@@ -1,15 +1,25 @@
 # Core runtime dependencies for rb3_hand_mimic
 #
-# Notes for Qualcomm RB3 Gen 2 (ARM64 / aarch64):
-#  - opencv-python wheels exist for aarch64; if pip install is slow or fails,
-#    fall back to the distro package:  sudo apt install -y python3-opencv
-#  - mediapipe publishes aarch64 wheels for recent versions. If it will not
-#    install on the RB3, the tracker is behind an interface (see
-#    src/hand_tracker.py) so it can be swapped for TFLite/ONNX/QNN later.
-#    The rest of the pipeline still runs with --dry-run for bring-up.
+# This project's logic is CPU-architecture independent: the SAME code runs on
+# x86_64 (AMD/Intel) and aarch64 (ARM, incl. the Qualcomm RB3 Gen 2). Only the
+# binary wheels below differ per architecture, and all of them publish both
+# x86_64 and aarch64 manylinux wheels for Linux (plus Windows/macOS wheels for
+# development machines).
+#
+# Qualcomm RB3 Gen 2 (Ubuntu, aarch64) notes:
+#  - opencv-python: if the pip wheel is slow/broken on aarch64, use the distro
+#    build instead:  sudo apt install -y python3-opencv
+#    For a DISPLAY-LESS (headless) deployment, prefer opencv-python-headless to
+#    avoid pulling libGL/X11 system deps:  pip install opencv-python-headless
+#    (the demo's --headless / --no-window modes never call cv2.imshow).
+#  - mediapipe: publishes aarch64 wheels for recent versions. If it will NOT
+#    install on your RB3 image, the tracker sits behind an interface
+#    (src/hand_tracker.py): bring the system up immediately with --dry-run,
+#    and/or add a TFLite/ONNX/QNN backend later -- the rest of the pipeline is
+#    unchanged.
 
-numpy>=1.23,<2.0
-opencv-python>=4.7,<5.0
-mediapipe>=0.10.9 ; platform_machine != "unsupported"
+numpy>=1.23,<2.0          # <2.0 for mediapipe 0.10.x ABI compatibility (all arches)
+opencv-python>=4.7,<5.0   # or opencv-python-headless on a display-less RB3
+mediapipe>=0.10.9
 pyserial>=3.5
 PyYAML>=6.0

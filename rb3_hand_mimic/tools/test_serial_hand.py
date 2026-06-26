@@ -63,6 +63,10 @@ def main() -> int:
     else:
         hand_dict = {}
     hand_cfg = HandConfig.from_dict(hand_dict)
+    # This tool specifically exercises the SERIAL protocol, regardless of which
+    # backend config.yaml selects for the demo (default is now "sdk"). --dry-run
+    # still forces the mock controller via create_controller(force_mock=...).
+    hand_cfg.controller = "serial"
     if args.port:
         hand_cfg.port = args.port
 

@@ -32,18 +32,40 @@ class Diagnostics:
     output_mirror: bool = False
     fps_meter: FpsMeter = field(default_factory=lambda: FpsMeter(30))
 
+    # Async-pipeline responsiveness metrics (populated from metrics.snapshot()).
+    detect_fps: float = 0.0
+    detect_p50_ms: float = 0.0
+    detect_p90_ms: float = 0.0
+    e2e_p50_ms: float = 0.0
+    control_hz: float = 0.0
+    detection_rate: float = 0.0
+
     def tick(self) -> None:
         self.fps_meter.tick()
         self.fps = self.fps_meter.fps()
+
+    def update_from_metrics(self, snap: Dict) -> None:
+        """Copy the headline numbers out of a metrics.Metrics snapshot dict."""
+        self.detect_fps = float(snap.get("detect_fps", 0.0))
+        self.control_hz = float(snap.get("control_hz", 0.0))
+        self.detection_rate = float(snap.get("detection_rate", 0.0))
+        det = snap.get("detect_ms")
+        e2e = snap.get("e2e_ms")
+        if det is not None:
+            self.detect_p50_ms = det.p50
+            self.detect_p90_ms = det.p90
+        if e2e is not None:
+            self.e2e_p50_ms = e2e.p50
 
     # -- headless logging ---------------------------------------------------
     def status_line(self) -> str:
         cmd = " ".join(f"{f[0]}:{self.command.get(f, 0.0):.2f}" for f in FINGERS)
         return (
-            f"cam={self.camera_index} fps={self.fps:4.1f} "
-            f"lat={self.latency_ms:5.1f}ms hand={self.handedness} "
-            f"sel={'Y' if self.selected else 'N'} "
-            f"serial={'up' if self.serial_connected else 'DOWN'} "
+            f"cam={self.camera_index} det={self.detect_fps:4.1f}fps "
+            f"lat p50/p90={self.detect_p50_ms:4.1f}/{self.detect_p90_ms:4.1f}ms "
+            f"e2e={self.e2e_p50_ms:5.1f}ms ctrl={self.control_hz:4.0f}hz "
+            f"hand={self.handedness} sel={'Y' if self.selected else 'N'} "
+            f"hw={'up' if self.serial_connected else 'DOWN'} "
             f"track={self.track_state} | {cmd}"
         )
 
@@ -72,15 +94,17 @@ def draw_overlay(
         cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     if draw_fps:
-        put(f"cam {diag.camera_index}  {diag.fps:4.1f} fps  {diag.latency_ms:4.1f} ms", 20, yellow)
+        put(f"cam {diag.camera_index}   detect {diag.detect_fps:4.1f} fps", 20, yellow)
+        put(f"det lat p50/p90 {diag.detect_p50_ms:4.1f}/{diag.detect_p90_ms:4.1f} ms   "
+            f"e2e {diag.e2e_p50_ms:5.1f} ms   ctrl {diag.control_hz:4.0f} hz", 40, yellow)
 
-    serial_color = green if diag.serial_connected else red
-    put(f"serial: {'connected' if diag.serial_connected else 'DISCONNECTED'}", 40, serial_color)
+    hw_color = green if diag.serial_connected else red
+    put(f"hand: {'connected' if diag.serial_connected else 'DISCONNECTED'}", 60, hw_color)
 
     track_color = green if diag.track_state == "active" else yellow
-    put(f"track: {diag.track_state}   hand: {diag.handedness}   sel: {'Y' if diag.selected else 'N'}", 60, track_color)
+    put(f"track: {diag.track_state}   hand: {diag.handedness}   sel: {'Y' if diag.selected else 'N'}", 80, track_color)
 
-    put(f"cam_mirror: {diag.camera_mirror}   out_mirror: {diag.output_mirror}", 80)
+    put(f"cam_mirror: {diag.camera_mirror}   out_mirror: {diag.output_mirror}", 100)
 
     if draw_curl_bars:
         _draw_curl_bars(frame, diag.command, origin_y=h - 110)

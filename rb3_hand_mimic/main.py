@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """rb3_hand_mimic -- real-time robotic hand mimic for the Qualcomm RB3 Gen 2.
 
-Pipeline:
-  tracking camera -> latest-frame capture -> MediaPipe landmarks -> select hand
-  -> handedness/mirror transform -> finger curls -> calibration normalize
-  -> smoothing/deadband -> safety clamp/watchdog -> Paxini hand controller
+Async pipeline (detection is decoupled from hand control):
+
+  camera thread  -> latest-frame capture
+  detection thread (HOT PATH): MediaPipe landmarks -> select hand ->
+      handedness/mirror transform -> finger curls -> calibration -> smoothing
+      -> publishes the latest PoseSample
+  control thread: safety clamp/watchdog -> hand controller (SDK / serial / mock)
+
+Detection never waits on hand control, so a slow or not-yet-ported hand SDK
+cannot reduce tracking responsiveness. See src/pipeline.py for the rationale.
 
 Run examples:
   python main.py --config config.yaml --debug
   python main.py --config config.yaml --headless
   python main.py --dry-run --debug
+  python main.py --benchmark 15            # 15s detection-responsiveness report
+  python main.py --benchmark --debug       # benchmark with the live window
   python main.py --camera-index 2 --dry-run --debug
   python main.py --list-cameras
   python main.py --list-serial
@@ -29,18 +37,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.calibration import load_calibration  # noqa: E402
 from src.camera import (  # noqa: E402
+    Camera,
     CameraConfig,
     discover_cameras,
     open_camera_from_config,
 )
 from src.diagnostics import Diagnostics, HeadlessReporter, draw_overlay  # noqa: E402
-from src.gesture_mapper import GestureMapper, HandPose  # noqa: E402
+from src.gesture_mapper import GestureMapper  # noqa: E402
 from src.hand_controller import (  # noqa: E402
+    BaseHandController,
     HandConfig,
     create_controller,
     list_serial_ports,
 )
-from src.hand_tracker import TrackerConfig, create_tracker  # noqa: E402
+from src.hand_tracker import (  # noqa: E402
+    BaseHandTracker,
+    TrackerConfig,
+    create_tracker,
+)
+from src.metrics import Metrics  # noqa: E402
+from src.pipeline import ControlWorker, DetectionWorker, LatestSlot  # noqa: E402
 from src.safety import SafetyConfig, SafetyManager  # noqa: E402
 from src.smoothing import Smoother, SmoothingConfig  # noqa: E402
 from src.transform import Transform, TransformConfig  # noqa: E402
@@ -58,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--headless", action="store_true", help="No GUI; log status periodically")
     p.add_argument("--no-window", action="store_true", help="Disable the OpenCV window")
     p.add_argument("--dry-run", action="store_true", help="Use MockHandController (no hardware)")
+    p.add_argument(
+        "--benchmark", nargs="?", type=float, const=0.0, default=None,
+        metavar="SECONDS",
+        help="Measure detection responsiveness. Optional duration in seconds "
+             "(omit value to run until Ctrl+C). No window unless --debug is also set.",
+    )
     p.add_argument("--camera-index", type=int, default=None, help="Force a camera index")
     p.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     p.add_argument("--list-cameras", action="store_true", help="Discover cameras and exit")
@@ -66,7 +88,7 @@ def parse_args() -> argparse.Namespace:
 
 
 class HandMimicApp:
-    """Owns all pipeline objects and the main loop, with clean shutdown."""
+    """Owns the pipeline objects and the two async workers, with clean shutdown."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -90,41 +112,62 @@ class HandMimicApp:
         self.safety_cfg = SafetyConfig.from_dict(self.cfg.get("safety", {}))
         self.hand_cfg = HandConfig.from_dict(self.cfg.get("hand", {}))
         self.debug_cfg = self.cfg.get("debug", {}) or {}
+        self.pipeline_cfg = self.cfg.get("pipeline", {}) or {}
 
-        # Pipeline components (created in setup()).
-        self.camera = None
-        self.tracker = None
+        # Run modes.
+        self.benchmark = args.benchmark is not None
+        self.benchmark_seconds = float(args.benchmark or 0.0)
+
+        # Stateless / single-thread-safe pipeline objects.
         self.mapper = GestureMapper()
         self.calibration = load_calibration(self.cfg, args.config)
         self.transform = Transform(self.transform_cfg)
         self.smoother = Smoother(self.smoothing_cfg)
         self.safety = SafetyManager(self.safety_cfg, self.hand_cfg.rest_pose)
-        self.controller = None
+
+        # Async machinery.
+        self.metrics = Metrics(window=int(self.pipeline_cfg.get("metrics_window", 150)))
+        self.slot = LatestSlot()
+        self.control_tick_hz = float(self.pipeline_cfg.get("control_tick_hz", 120.0))
+
+        # Created in setup().
+        self.camera: Optional[Camera] = None
+        self.tracker: Optional[BaseHandTracker] = None
+        self.controller: Optional[BaseHandController] = None
+        self.detection: Optional[DetectionWorker] = None
+        self.control: Optional[ControlWorker] = None
 
         self.diag = Diagnostics()
         self.diag.camera_mirror = self.transform_cfg.camera_mirror
         self.diag.output_mirror = self.transform_cfg.output_mirror
 
         self._running = False
-        self._last_frame_id = -1
 
-        # Window policy: debug shows it; headless/no-window never does.
+        # Window policy: debug shows it; headless/no-window/benchmark never do
+        # (benchmark wants raw detection speed unless you explicitly add --debug).
+        want_window = args.debug or self.debug_cfg.get("show_window", False)
         self.show_window = (
-            (args.debug or self.debug_cfg.get("show_window", False))
+            want_window
             and not args.headless
             and not args.no_window
+            and not (self.benchmark and not args.debug)
         )
         self.headless_reporter = HeadlessReporter(
             float(self.debug_cfg.get("headless_status_seconds", 3.0))
         )
+        self.benchmark_report_seconds = float(
+            self.pipeline_cfg.get("benchmark_report_seconds", 1.0)
+        )
 
     # -- setup / teardown ---------------------------------------------------
     def setup(self) -> None:
-        self.logger.info("starting rb3_hand_mimic (dry_run=%s, headless=%s)",
-                         self.args.dry_run, self.args.headless)
+        self.logger.info(
+            "starting rb3_hand_mimic (dry_run=%s, headless=%s, benchmark=%s, async)",
+            self.args.dry_run, self.args.headless, self.benchmark,
+        )
 
-        # Controller first: if hardware missing and not dry-run, it degrades to
-        # reconnect attempts rather than crashing.
+        # Controller first: if hardware/SDK is missing it degrades gracefully
+        # (placeholder SDK / reconnect attempts) rather than crashing.
         self.controller = create_controller(
             self.hand_cfg,
             finger_order=self.transform_cfg.finger_order,
@@ -145,8 +188,37 @@ class HandMimicApp:
             self.logger.warning("using DEFAULT calibration ranges; run "
                                 "tools/record_calibration.py for best accuracy")
 
+        # Build the async workers.
+        self.detection = DetectionWorker(
+            camera=self.camera,
+            tracker=self.tracker,
+            mapper=self.mapper,
+            calibration=self.calibration,
+            transform=self.transform,
+            smoother=self.smoother,
+            tracker_cfg=self.tracker_cfg,
+            slot=self.slot,
+            metrics=self.metrics,
+            keep_debug_frames=self.show_window,
+        )
+        self.control = ControlWorker(
+            controller=self.controller,
+            safety=self.safety,
+            slot=self.slot,
+            metrics=self.metrics,
+            tick_hz=self.control_tick_hz,
+        )
+
     def teardown(self) -> None:
-        self.logger.info("shutting down; sending rest pose")
+        self.logger.info("shutting down; stopping workers and sending rest pose")
+        # Stop detection first so no new poses arrive, then stop control.
+        for worker in (self.detection, self.control):
+            if worker is not None:
+                worker.stop()
+        for worker in (self.detection, self.control):
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=1.0)
+
         try:
             if self.controller is not None:
                 self.controller.send_rest()
@@ -171,67 +243,77 @@ class HandMimicApp:
             except Exception:  # noqa: BLE001
                 pass
 
+        if self.benchmark:
+            print("\n" + self.metrics.summary())
+
     # -- main loop ----------------------------------------------------------
     def run(self) -> None:
         self._running = True
         self.setup()
-        self.logger.info("entering main loop")
+        assert self.detection is not None and self.control is not None
+        self.detection.start()
+        self.control.start()
+        self.logger.info("entering main loop (workers running)")
+
+        deadline = (
+            time.perf_counter() + self.benchmark_seconds
+            if self.benchmark and self.benchmark_seconds > 0
+            else None
+        )
+        last_report = 0.0
         try:
             while self._running:
-                self._iterate()
+                if not self.detection.is_alive() or not self.control.is_alive():
+                    self.logger.error("a worker thread died; exiting")
+                    break
+
+                if self.show_window:
+                    self._render()
+                else:
+                    now = time.perf_counter()
+                    interval = (
+                        self.benchmark_report_seconds if self.benchmark
+                        else self.headless_reporter.interval
+                    )
+                    if now - last_report >= interval:
+                        last_report = now
+                        self._refresh_diag()
+                        if self.benchmark:
+                            self.logger.info("%s", self.metrics.report_line())
+                        else:
+                            self.headless_reporter.maybe_log(self.diag)
+                    time.sleep(0.01)
+
+                if deadline is not None and time.perf_counter() >= deadline:
+                    self.logger.info("benchmark duration reached; stopping")
+                    break
         finally:
             self.teardown()
 
-    def _iterate(self) -> None:
-        frame, frame_id = self.camera.read()
-        if frame is None:
-            time.sleep(0.002)
-            return
+    def _refresh_diag(self) -> None:
+        """Pull the latest control + metrics state into the diagnostics snapshot."""
+        self.diag.update_from_metrics(self.metrics.snapshot())
+        if self.control is not None:
+            command, track_state, connected = self.control.status()
+            self.diag.command = command
+            self.diag.track_state = track_state
+            self.diag.serial_connected = connected
 
-        # Only process genuinely new frames -- don't reprocess duplicates.
-        is_new = frame_id != self._last_frame_id
-        self._last_frame_id = frame_id
-
-        t0 = time.perf_counter()
-        pose: Optional[HandPose] = None
-        selected_hand = None
-
-        if is_new:
-            self.diag.tick()
-            hands = self.tracker.process(frame)
-            selected_hand = self.tracker.select_best(hands, self.tracker_cfg)
-            if selected_hand is not None:
-                raw_pose = self.mapper.map(selected_hand)
-                norm_pose = self.calibration.normalize(raw_pose)
-                tf_pose = self.transform.apply(norm_pose)
-                pose = self.smoother.apply(tf_pose)
-                self.safety.update_pose(pose.as_dict())
-                self.diag.handedness = pose.handedness
-                self.diag.selected = True
-            else:
-                self.diag.selected = False
-
-        # Safety state machine + controller send run every iteration so the
-        # watchdog / return-to-rest behaves even when no new frame arrived.
-        command = self.safety.compute_output()
-        self.controller.send(command)
-
-        # Update diagnostics.
-        self.diag.command = command
-        self.diag.track_state = self.safety.current_state()
-        self.diag.serial_connected = self.controller.is_connected()
-        self.diag.latency_ms = (time.perf_counter() - t0) * 1000.0
-
-        if self.show_window and is_new:
-            self._render(frame, selected_hand, pose)
-        elif self.args.headless:
-            self.headless_reporter.maybe_log(self.diag)
-
-    def _render(self, frame, selected_hand, pose) -> None:
+    def _render(self) -> None:
         import cv2
 
-        # Draw landmarks on the ORIGINAL (unmirrored) frame; a later horizontal
-        # flip then keeps the skeleton aligned with the mirrored preview image.
+        assert self.detection is not None and self.tracker is not None
+        frame, selected_hand, pose = self.detection.debug_snapshot()
+        if frame is None:
+            time.sleep(0.005)
+            return
+
+        self._refresh_diag()
+        self.diag.selected = pose is not None
+        self.diag.handedness = pose.handedness if pose is not None else "-"
+
+        # Draw landmarks on the ORIGINAL (unmirrored) frame; the later flip then
+        # keeps the skeleton aligned with the mirrored selfie preview.
         if (
             selected_hand is not None
             and self.debug_cfg.get("draw_landmarks", True)
@@ -239,12 +321,10 @@ class HandMimicApp:
         ):
             try:
                 self.tracker.draw(frame, selected_hand)
-            except Exception as exc:  # noqa: BLE001 - drawing must never crash demo
+            except Exception as exc:  # noqa: BLE001 - drawing must never crash the demo
                 self.logger.debug("landmark draw failed: %s", exc)
 
-        # Flip for selfie preview, then draw text overlay (so text isn't mirrored).
         display = cv2.flip(frame, 1) if self.cam_cfg.mirror_preview else frame
-
         draw_overlay(
             display,
             self.diag,
@@ -294,7 +374,6 @@ def main() -> int:
     try:
         cfg_preview = load_config(args.config)
     except (FileNotFoundError, ValueError) as exc:
-        # list modes can still partially work, but config is needed; report.
         setup_logging("INFO")
         get_logger("main").error("%s", exc)
         return 2

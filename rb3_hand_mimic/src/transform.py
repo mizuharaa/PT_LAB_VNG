@@ -57,7 +57,7 @@ class TransformConfig:
 
     @classmethod
     def from_dict(cls, d: Dict) -> "TransformConfig":
-        order = list(d.get("finger_order", list(FINGERS)))
+        order: List[str] = [str(f) for f in d.get("finger_order", list(FINGERS))]
         # Validate finger order; fall back to canonical order if malformed.
         if sorted(order) != sorted(FINGERS):
             log.warning("transform.finger_order %r invalid; using default", order)

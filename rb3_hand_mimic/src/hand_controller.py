@@ -1,16 +1,23 @@
 """Robotic hand controller abstraction.
 
 The exact VNG x Paxini protocol is unknown at build time, so the controller is
-fully abstracted and the serial packet format is configurable (csv /
-labeled_csv / json). When the real protocol arrives, either pick the matching
-format in config or add a new `_format_*` method / Protocol subclass -- nothing
-upstream changes.
+fully abstracted. Every backend implements one method -- `_apply(values)` --
+that takes normalized per-finger curls (0..1) and drives the hardware however
+it likes (serial bytes, a vendor SDK call, or nothing). Rate-limiting lives in
+the base class, so a backend only worries about delivery.
 
 Controllers:
-  * BaseHandController  -- interface.
-  * MockHandController  -- logs commands; used for --dry-run / no hardware.
+  * BaseHandController   -- interface (send / send_rest / rate-limit).
+  * MockHandController   -- logs commands; used for --dry-run / no hardware.
   * SerialHandController -- pyserial, port auto-detect, reconnect w/ backoff,
-                            low-timeout non-blocking writes, command rate limit.
+                            low-timeout non-blocking writes.
+  * SdkHandController    -- drives the robotic hand through a vendor SDK
+                            (HandSdk). The real VNG x Paxini SDK is currently
+                            x86-only and not yet ported to the RB3 (aarch64),
+                            so the default backing is PlaceholderHandSdk: it
+                            validates and logs commands and lets the whole async
+                            pipeline run on any architecture today. Swap in the
+                            real binding by implementing HandSdk.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .utils import FINGERS, RateLimiter, clamp, get_logger
 
@@ -41,6 +48,7 @@ class HandConfig:
     servo_min: int = 0
     servo_max: int = 180
     decimals: int = 3
+    sdk_library: str = "placeholder"   # which HandSdk binding to load (sdk backend)
     rest_pose: Dict[str, float] = field(
         default_factory=lambda: {f: 0.0 for f in FINGERS}
     )
@@ -48,6 +56,7 @@ class HandConfig:
     @classmethod
     def from_dict(cls, d: Dict) -> "HandConfig":
         rest = d.get("rest_pose", {}) or {}
+        sdk = d.get("sdk", {}) or {}
         return cls(
             controller=str(d.get("controller", "serial")),
             port=str(d.get("port", "auto")),
@@ -60,6 +69,7 @@ class HandConfig:
             servo_min=int(d.get("servo_min", 0)),
             servo_max=int(d.get("servo_max", 180)),
             decimals=int(d.get("decimals", 3)),
+            sdk_library=str(sdk.get("library", "placeholder")),
             rest_pose={f: float(rest.get(f, 0.0)) for f in FINGERS},
         )
 
@@ -111,8 +121,9 @@ class BaseHandController(ABC):
     def connect(self) -> None: ...
 
     @abstractmethod
-    def _write(self, packet: bytes) -> bool:
-        """Return True on success, False on (recoverable) failure."""
+    def _apply(self, values: Dict[str, float]) -> bool:
+        """Deliver one command to the hardware. Return True on success, False on
+        (recoverable) failure. `values` are normalized curls keyed by finger."""
 
     @abstractmethod
     def is_connected(self) -> bool: ...
@@ -124,8 +135,7 @@ class BaseHandController(ABC):
         """Rate-limited send. `force` bypasses the rate limiter (rest poses)."""
         if not force and not self._limiter.ready():
             return False
-        packet = format_command(values, self.finger_order, self.cfg)
-        ok = self._write(packet)
+        ok = self._apply(values)
         if ok:
             self._last_sent = dict(values)
         return ok
@@ -149,7 +159,8 @@ class MockHandController(BaseHandController):
         self._connected = True
         log.info("MockHandController active (dry-run, protocol=%s)", self.cfg.protocol)
 
-    def _write(self, packet: bytes) -> bool:
+    def _apply(self, values: Dict[str, float]) -> bool:
+        packet = format_command(values, self.finger_order, self.cfg)
         log.debug("MOCK -> %s", packet.decode("utf-8").rstrip("\n"))
         return True
 
@@ -202,7 +213,7 @@ class SerialHandController(BaseHandController):
 
     def __init__(self, cfg: HandConfig, finger_order: Optional[List[str]] = None) -> None:
         super().__init__(cfg, finger_order)
-        self._serial = None
+        self._serial: Optional[Any] = None   # pyserial Serial; Any avoids a hard dep
         self._port: Optional[str] = None
         self._backoff = 0.5
         self._backoff_max = 5.0
@@ -258,6 +269,9 @@ class SerialHandController(BaseHandController):
     def is_connected(self) -> bool:
         return self._serial is not None and getattr(self._serial, "is_open", False)
 
+    def _apply(self, values: Dict[str, float]) -> bool:
+        return self._write(format_command(values, self.finger_order, self.cfg))
+
     def _write(self, packet: bytes) -> bool:
         # Never block the real-time loop: reconnection is attempted opportun-
         # istically and write failures degrade gracefully to a retry schedule.
@@ -265,8 +279,11 @@ class SerialHandController(BaseHandController):
             self._maybe_reconnect()
             if not self.is_connected():
                 return False
+        serial_obj = self._serial
+        if serial_obj is None:
+            return False
         try:
-            self._serial.write(packet)
+            serial_obj.write(packet)
             return True
         except Exception as exc:  # noqa: BLE001 - SerialException, write timeout, etc.
             log.warning("serial write failed (%s); dropping connection", exc)
@@ -288,6 +305,126 @@ class SerialHandController(BaseHandController):
 
 
 # -----------------------------------------------------------------------------
+# Vendor SDK backend (ARM64 target)
+# -----------------------------------------------------------------------------
+class HandSdk(ABC):
+    """Interface the robotic-hand vendor SDK must satisfy.
+
+    This is the seam between our pipeline and the VNG x Paxini hand SDK. The
+    real SDK is currently distributed as an x86 build and does NOT run on the
+    Qualcomm RB3 Gen 2 (aarch64). When an ARM64 build (or a ctypes/cffi binding,
+    or a gRPC shim to a co-located x86 helper) becomes available, implement this
+    interface and hand it to SdkHandController -- nothing else in the pipeline
+    changes.
+    """
+
+    @abstractmethod
+    def connect(self) -> bool:
+        """Open the device. Return True on success."""
+
+    @abstractmethod
+    def set_curls(self, curls: Dict[str, float]) -> bool:
+        """Command finger curls (finger name -> 0..1). Return True on success."""
+
+    @abstractmethod
+    def is_connected(self) -> bool: ...
+
+    @abstractmethod
+    def disconnect(self) -> None: ...
+
+
+class PlaceholderHandSdk(HandSdk):
+    """No-hardware stand-in for the real ARM64 hand SDK.
+
+    Lets the full async detection->control pipeline run on any architecture
+    today (x86 dev box or the RB3) before the ARM64 SDK exists. It validates the
+    finger values and logs them at a throttled rate; it never touches hardware.
+
+    TODO(vng-paxini-arm64): replace with the real SDK binding. Each method below
+    maps 1:1 to a call the production SDK is expected to expose.
+    """
+
+    def __init__(self, finger_order: Optional[List[str]] = None, log_every: int = 30) -> None:
+        self.finger_order = finger_order or list(FINGERS)
+        self._connected = False
+        self._count = 0
+        self._log_every = max(1, log_every)
+
+    def connect(self) -> bool:
+        # TODO: sdk.open() / device handshake on the ARM64 build.
+        self._connected = True
+        log.info(
+            "PlaceholderHandSdk connected (NO HARDWARE). Real ARM64 SDK pending; "
+            "commands are logged only. finger_order=%s", self.finger_order,
+        )
+        return True
+
+    def set_curls(self, curls: Dict[str, float]) -> bool:
+        # TODO: translate normalized curls -> SDK joint/servo targets and push.
+        if not self._connected:
+            return False
+        self._count += 1
+        if self._count % self._log_every == 0:
+            ordered = ", ".join(f"{f}:{clamp(curls.get(f, 0.0), 0.0, 1.0):.2f}"
+                                for f in self.finger_order)
+            log.debug("SDK(placeholder) <- %s", ordered)
+        return True
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def disconnect(self) -> None:
+        # TODO: sdk.close() on the ARM64 build.
+        self._connected = False
+        log.info("PlaceholderHandSdk disconnected (sent %d commands)", self._count)
+
+
+def load_hand_sdk(cfg: HandConfig, finger_order: Optional[List[str]] = None) -> HandSdk:
+    """Resolve the HandSdk implementation to use.
+
+    Today this always returns the placeholder. When the ARM64 SDK ships, branch
+    on cfg.sdk_library here (import the binding, construct it) and fall back to
+    the placeholder if the import fails -- so the demo still runs anywhere.
+    """
+    lib = (cfg.sdk_library or "placeholder").lower()
+    if lib in ("placeholder", "", "mock", "none"):
+        return PlaceholderHandSdk(finger_order)
+    # TODO(vng-paxini-arm64): import and construct the real binding here, e.g.
+    #   from paxini_arm64 import PaxiniHand
+    #   return PaxiniHandSdkAdapter(PaxiniHand(...))
+    log.warning(
+        "hand.sdk.library=%r requested but no ARM64 binding is wired in yet; "
+        "falling back to PlaceholderHandSdk.", cfg.sdk_library,
+    )
+    return PlaceholderHandSdk(finger_order)
+
+
+class SdkHandController(BaseHandController):
+    """Controller that drives the robotic hand through a HandSdk implementation."""
+
+    def __init__(
+        self,
+        cfg: HandConfig,
+        finger_order: Optional[List[str]] = None,
+        sdk: Optional[HandSdk] = None,
+    ) -> None:
+        super().__init__(cfg, finger_order)
+        self._sdk = sdk or load_hand_sdk(cfg, self.finger_order)
+
+    def connect(self) -> None:
+        self._sdk.connect()
+
+    def _apply(self, values: Dict[str, float]) -> bool:
+        return self._sdk.set_curls(values)
+
+    def is_connected(self) -> bool:
+        return self._sdk.is_connected()
+
+    def close(self) -> None:
+        self._sdk.disconnect()
+
+
+# -----------------------------------------------------------------------------
 # Factory
 # -----------------------------------------------------------------------------
 def create_controller(
@@ -298,8 +435,12 @@ def create_controller(
     """Instantiate the configured controller. `force_mock` honors --dry-run."""
     if force_mock or cfg.controller.lower() == "mock":
         return MockHandController(cfg, finger_order)
-    if cfg.controller.lower() == "serial":
+    backend = cfg.controller.lower()
+    if backend == "serial":
         return SerialHandController(cfg, finger_order)
+    if backend == "sdk":
+        return SdkHandController(cfg, finger_order)
     raise ValueError(
-        f"Unknown hand.controller '{cfg.controller}'. Supported: 'serial', 'mock'."
+        f"Unknown hand.controller '{cfg.controller}'. "
+        "Supported: 'sdk', 'serial', 'mock'."
     )
