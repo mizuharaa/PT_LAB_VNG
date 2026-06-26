@@ -92,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera-index", type=int, default=None, help="Force the primary camera index")
     p.add_argument("--camera2-index", type=int, default=None,
                    help="Enable the second (fusion) camera at this index")
+    p.add_argument("--no-dual", action="store_true",
+                   help="Force single-camera mode (ignore camera2/fusion)")
     p.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     p.add_argument("--list-cameras", action="store_true", help="Discover cameras and exit")
     p.add_argument("--list-serial", action="store_true", help="List serial ports and exit")
@@ -143,7 +145,10 @@ class HandMimicApp:
         # the first view occludes; their per-finger curls are fused. Off by
         # default, so the standard path stays single-camera and lightweight.
         cam2 = self.cfg.get("camera2", {}) or {}
-        self.dual = bool(cam2.get("enabled", False)) or args.camera2_index is not None
+        self.dual = (
+            (bool(cam2.get("enabled", False)) or args.camera2_index is not None)
+            and not args.no_dual
+        )
         # Secondary camera config = primary's settings overlaid with camera2 keys.
         self.cam2_cfg = CameraConfig.from_dict({**(self.cfg.get("camera", {}) or {}), **cam2})
         # Camera index selections (None = auto-discover). Editable via the debug
