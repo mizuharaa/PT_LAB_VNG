@@ -1,7 +1,7 @@
 # rb3_hand_mimic
 
-Real-time robotic hand mimic demo for the **Qualcomm RB3 Gen 2**.
-
+Real-time robotic hand mimic demo for the **Qualcomm RB3 Gen 2** (Any ARM-based device).
+Currently this only works on local device for detection purposes, to properly communicate with the robotics hand we need a proper SDK file for arm64 arch.
 A visitor faces their palm at the RB3 **tracking camera**; the software detects
 hand landmarks, maps the pose to finger curls, corrects mirroring/handedness,
 smooths and safety-clamps the values, and drives the **VNG × Paxini** robotic
