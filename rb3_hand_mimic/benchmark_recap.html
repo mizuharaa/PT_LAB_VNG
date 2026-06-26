@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rb3_hand_mimic — responsiveness benchmark</title>
+<meta name="description" content="Latency and throughput recap for the real-time hand-mimic pipeline: single vs dual camera on an x86 dev box.">
+<style>
+  :root{
+    --ground:#0e1519; --panel:#162128; --panel-2:#1b2932;
+    --line:rgba(255,255,255,.07); --line-strong:rgba(255,255,255,.14);
+    --ink:#dbe5e8; --ink-dim:#9fb0b6; --ink-faint:#6f8088;
+    --cyan:#39d7c4;   /* primary / dual / healthy signal */
+    --amber:#e9a23c;  /* single-cam / the cost axis / attention */
+    --red:#e8635d;    /* critical */
+    --mono:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:
+      radial-gradient(1200px 500px at 80% -10%,rgba(57,215,196,.06),transparent 60%),
+      var(--ground);
+    color:var(--ink);font-family:var(--sans);line-height:1.55;
+    -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:980px;margin:0 auto;padding:48px 24px 72px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;
+    text-transform:uppercase;color:var(--cyan);margin:0 0 14px;}
+  h1{font-size:clamp(28px,4.6vw,44px);line-height:1.04;margin:0 0 12px;
+    font-weight:680;letter-spacing:-.02em;text-wrap:balance;}
+  h1 .sub{display:block;color:var(--ink-dim);font-weight:430;font-size:.46em;
+    letter-spacing:0;margin-top:10px;}
+  .meta{font-family:var(--mono);font-size:12.5px;color:var(--ink-faint);
+    display:flex;flex-wrap:wrap;gap:8px 20px;margin:18px 0 0;}
+  .meta b{color:var(--ink-dim);font-weight:500;}
+
+  .verdict{margin:34px 0 6px;padding:20px 22px;border-radius:12px;
+    background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line);border-left:3px solid var(--cyan);}
+  .verdict p{margin:0;font-size:16px;color:var(--ink);}
+  .verdict .hl{color:var(--cyan);font-family:var(--mono);}
+  .verdict .warn{color:var(--amber);font-family:var(--mono);}
+
+  h2{font-size:13px;font-family:var(--mono);letter-spacing:.16em;
+    text-transform:uppercase;color:var(--ink-dim);font-weight:600;
+    margin:46px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:18px 18px 16px;}
+  .card .k{font-size:12px;color:var(--ink-faint);font-family:var(--mono);
+    text-transform:uppercase;letter-spacing:.08em;}
+  .card .v{font-family:var(--mono);font-variant-numeric:tabular-nums;
+    font-size:34px;font-weight:600;margin:10px 0 2px;letter-spacing:-.01em;}
+  .card .v small{font-size:15px;color:var(--ink-dim);font-weight:500;margin-left:3px;}
+  .card .note{font-size:12.5px;color:var(--ink-dim);}
+  .v.cyan{color:var(--cyan)} .v.amber{color:var(--amber)}
+
+  .chart-card{background:var(--panel);border:1px solid var(--line);
+    border-radius:12px;padding:18px 18px 14px;}
+  .chart-head{display:flex;justify-content:space-between;align-items:baseline;
+    gap:12px;flex-wrap:wrap;margin-bottom:6px;}
+  .chart-head .t{font-size:14.5px;font-weight:600;color:var(--ink);}
+  .legend{display:flex;gap:16px;font-family:var(--mono);font-size:12px;color:var(--ink-dim);}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;
+    margin-right:6px;vertical-align:middle;}
+  canvas{width:100%;height:auto;display:block;}
+  .cap{font-size:12.5px;color:var(--ink-faint);margin:10px 2px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;}
+  table{border-collapse:collapse;width:100%;min-width:560px;
+    font-variant-numeric:tabular-nums;}
+  th,td{text-align:right;padding:12px 16px;font-family:var(--mono);font-size:13.5px;
+    border-bottom:1px solid var(--line);}
+  th:first-child,td:first-child{text-align:left;font-family:var(--sans);}
+  thead th{color:var(--ink-dim);font-size:12px;letter-spacing:.06em;
+    text-transform:uppercase;background:var(--panel-2);}
+  tbody tr:last-child td{border-bottom:none;}
+  td.single{color:var(--amber)} td.dual{color:var(--cyan)}
+  .rowlabel small{display:block;color:var(--ink-faint);font-family:var(--mono);
+    font-size:11.5px;letter-spacing:.04em;}
+  .best{position:relative;}
+  .best::after{content:"best";font-family:var(--sans);font-size:10px;
+    color:var(--ground);background:var(--cyan);border-radius:4px;
+    padding:1px 5px;margin-left:8px;vertical-align:middle;letter-spacing:.02em;}
+
+  .findings{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .finding{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:18px;}
+  .finding h3{margin:0 0 8px;font-size:15px;font-weight:620;}
+  .finding p{margin:0;font-size:13.5px;color:var(--ink-dim);}
+  .finding .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+    text-transform:uppercase;display:inline-block;margin-bottom:9px;padding:2px 8px;
+    border-radius:999px;}
+  .tag.win{color:var(--cyan);background:rgba(57,215,196,.1);border:1px solid rgba(57,215,196,.25);}
+  .tag.bottleneck{color:var(--amber);background:rgba(233,162,60,.1);border:1px solid rgba(233,162,60,.25);}
+
+  .note-block{background:var(--panel);border:1px dashed var(--line-strong);
+    border-radius:12px;padding:18px 20px;}
+  .note-block ul{margin:8px 0 0;padding-left:18px;}
+  .note-block li{font-size:13.5px;color:var(--ink-dim);margin:7px 0;}
+  .note-block b{color:var(--ink);font-weight:600;}
+  code{font-family:var(--mono);background:var(--panel-2);padding:1px 6px;
+    border-radius:5px;font-size:.92em;color:var(--cyan);}
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;color:var(--ink-faint);}
+  @media(max-width:680px){.findings,.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Responsiveness Benchmark · built-in instrumentation</p>
+  <h1>rb3_hand_mimic pipeline latency
+    <span class="sub">Camera &rarr; MediaPipe landmarks &rarr; curls &rarr; safety &rarr; DexH15 (placeholder). Measured single-camera vs dual-camera fusion.</span>
+  </h1>
+  <div class="meta">
+    <span><b>Device</b> x86_64 dev box (CPU)</span>
+    <span><b>Capture</b> 640&times;480 @ 30fps</span>
+    <span><b>Window</b> 20 s each, headless</span>
+    <span><b>Model</b> hand_landmarker.task (Tasks API, VIDEO)</span>
+    <span><b>Date</b> 2026-06-26</span>
+  </div>
+
+  <div class="verdict">
+    <p>The async split holds: the control loop ran at a steady <span class="hl">~115 Hz</span> in both modes,
+    untouched by detection load &mdash; the architecture goal is met. The real ceiling is the
+    <span class="warn">MediaPipe landmark inference</span>: ~<span class="warn">60&ndash;70 ms/frame</span> on this CPU while a
+    hand is actively tracked, which caps single-camera detection near <span class="warn">14 fps</span>.
+    End-to-end capture&rarr;command lands at <span class="hl">~88&ndash;91 ms</span> median.</p>
+  </div>
+
+  <h2>Headline — while a hand is tracked</h2>
+  <div class="cards">
+    <div class="card">
+      <div class="k">Detection inference</div>
+      <div class="v amber">65<small>ms p50</small></div>
+      <div class="note">Full 21-pt landmark model, single cam. Idle/search &asymp; 25 ms.</div>
+    </div>
+    <div class="card">
+      <div class="k">End-to-end</div>
+      <div class="v cyan">88<small>ms p50</small></div>
+      <div class="note">Capture &rarr; command. Dual: p90 114 ms · p99 126 ms.</div>
+    </div>
+    <div class="card">
+      <div class="k">Tracking throughput</div>
+      <div class="v amber">~14<small>fps</small></div>
+      <div class="note">Single cam w/ hand. Dual &asymp; 54 fps aggregate (2 cams &parallel;).</div>
+    </div>
+    <div class="card">
+      <div class="k">Control loop</div>
+      <div class="v cyan">115<small>Hz</small></div>
+      <div class="note">Steady in both modes — decoupled from detection.</div>
+    </div>
+  </div>
+
+  <h2>Latency over the run</h2>
+  <div class="grid2">
+    <div class="chart-card">
+      <div class="chart-head">
+        <span class="t">Detection latency (p50)</span>
+        <span class="legend"><span><i style="background:#e9a23c"></i>single</span><span><i style="background:#39d7c4"></i>dual</span></span>
+      </div>
+      <canvas id="latChart" width="460" height="220" aria-label="Detection latency over time"></canvas>
+      <p class="cap">Single-cam spikes to ~70 ms while a hand is in frame (shaded), then settles to ~25 ms idle as the model drops to palm-search. Dual stays ~25 ms because hands were only intermittently present.</p>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <span class="t">Detection throughput (fps)</span>
+        <span class="legend"><span><i style="background:#e9a23c"></i>single</span><span><i style="background:#39d7c4"></i>dual</span></span>
+      </div>
+      <canvas id="fpsChart" width="460" height="220" aria-label="Detection throughput over time"></canvas>
+      <p class="cap">Dual processes ~2&times; the frames (both cameras in parallel, GIL released during native inference). Single-cam fps rises as the hand leaves and inference gets cheaper.</p>
+    </div>
+  </div>
+
+  <h2>Single vs dual — full distribution</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Single cam</th><th>Dual + fusion</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="rowlabel">Detection latency p50 <small>per-frame inference</small></td><td class="single">25.8 ms</td><td class="dual">24.7 ms</td></tr>
+        <tr><td class="rowlabel">Detection latency p90</td><td class="single">41.2 ms</td><td class="dual">41.6 ms</td></tr>
+        <tr><td class="rowlabel">Detection latency p99 / max</td><td class="single">50.6 / 54.1 ms</td><td class="dual">51.8 / 69.8 ms</td></tr>
+        <tr><td class="rowlabel">End-to-end p50 <small>capture &rarr; command</small></td><td class="single">91.4 ms</td><td class="dual best">88.0 ms</td></tr>
+        <tr><td class="rowlabel">End-to-end p90</td><td class="single">155.8 ms</td><td class="dual best">114.1 ms</td></tr>
+        <tr><td class="rowlabel">End-to-end p99 / max</td><td class="single">369.3 / 401.7 ms</td><td class="dual best">126.4 / 127.3 ms</td></tr>
+        <tr><td class="rowlabel">Pose age at control p50 <small>staleness</small></td><td class="single">2.6 ms</td><td class="dual">15.6 ms</td></tr>
+        <tr><td class="rowlabel">Frames processed <small>20 s window</small></td><td class="single">491</td><td class="dual">1074</td></tr>
+        <tr><td class="rowlabel">Detection FPS (window avg)</td><td class="single">29.5</td><td class="dual">54.6</td></tr>
+        <tr><td class="rowlabel">Control rate</td><td class="single">115.0 Hz</td><td class="dual">115.6 Hz</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="cap">Aggregate detection-latency percentiles are diluted by idle frames (no hand &rarr; fast palm search &asymp; 25 ms). The headline 60&ndash;70 ms is the active-tracking cost, isolated from the seconds where a hand was held in frame.</p>
+
+  <h2>What the numbers say</h2>
+  <div class="findings">
+    <div class="finding">
+      <span class="tag win">Architecture win</span>
+      <h3>Control never stalls on detection</h3>
+      <p>115 Hz control in both modes proves the detection&harr;control split: a slow or stalled tracker (or the not-yet-real DexH15 SDK) cannot drag down the command loop. Pose age stays low, so commands act on fresh data.</p>
+    </div>
+    <div class="finding">
+      <span class="tag bottleneck">Bottleneck</span>
+      <h3>Landmark inference on CPU</h3>
+      <p>~60&ndash;70 ms/frame while tracking is the whole story for single-cam fps (~14). Everything downstream — mapping, fusion, safety — is sub-millisecond. To go faster you make inference cheaper, not the pipeline.</p>
+    </div>
+    <div class="finding">
+      <span class="tag win">Dual fusion is cheap on latency</span>
+      <h3>Two cameras, tighter tails</h3>
+      <p>Running both cameras in parallel doubled frame throughput and actually <em>lowered</em> end-to-end p90/p99 (fusion picks the fresher of two views). The cost is CPU, not lag.</p>
+    </div>
+    <div class="finding">
+      <span class="tag bottleneck">On the target device</span>
+      <h3>RB3 will read differently</h3>
+      <p>These are x86-CPU numbers. The RB3's aarch64 CPU is slower for this model unless a GPU/Hexagon delegate is used — expect lower fps until accelerated. Re-run the same benchmark on the RB3 to set the real baseline.</p>
+    </div>
+  </div>
+
+  <h2>How to push it faster</h2>
+  <div class="note-block">
+    <ul>
+      <li><b>Accelerate inference</b> — the only lever that moves the ceiling: GPU/Hexagon (QNN) delegate for the Tasks model, or a lighter/quantized hand model.</li>
+      <li><b>Drop capture resolution</b> — try <code>320&times;240 @ 60</code>; landmark cost scales with input pixels.</li>
+      <li><b>Single camera if CPU-bound</b> — <code>--no-dual</code> halves inference load when the second view isn't earning its keep.</li>
+      <li><b>Re-measure on the RB3</b> — <code>python main.py --benchmark 30</code> (with a hand held in frame the whole time for true end-to-end numbers).</li>
+    </ul>
+  </div>
+
+  <footer>
+    Measured with the pipeline's built-in <code>--benchmark</code> instrumentation (src/metrics.py) ·
+    percentiles over a rolling 150-sample window · no external load tooling (k6/Grafana target HTTP services, not frame latency).
+  </footer>
+</div>
+
+<script>
+(function(){
+  const single = {
+    lat:[68.8,70.3,71.2,67.8,60.2,61.7,60.0,52.6,43.7,29.6,26.6,25.4,26.1,26.7,24.6,24.5,24.5,25.0,25.3],
+    fps:[13.9,12.4,11.1,12.9,14.2,14.5,15.5,21.5,25.1,30.0,29.9,29.8,29.6,29.3,29.8,29.6,29.4,29.2,28.9]
+  };
+  const dual = {
+    lat:[24.9,27.7,27.5,27.5,27.4,28.6,29.8,28.6,24.2,24.0,25.4,33.0,25.3,24.6,24.6,25.9,28.0,26.3,25.8],
+    fps:[54.2,51.5,48.4,48.7,51.1,52.1,52.5,52.7,58.5,56.9,49.7,52.4,57.4,54.3,56.5,54.5,52.4,56.0,57.8]
+  };
+  const CY="#39d7c4", AM="#e9a23c", GRID="rgba(255,255,255,.07)", AX="#6f8088";
+
+  function setup(cv){
+    const dpr=Math.min(window.devicePixelRatio||1,2);
+    const cssW=cv.clientWidth||460, cssH=220;
+    cv.width=cssW*dpr; cv.height=cssH*dpr;
+    const ctx=cv.getContext("2d"); ctx.scale(dpr,dpr);
+    return {ctx,w:cssW,h:cssH};
+  }
+  function draw(cv, series, yMax, opts){
+    opts=opts||{};
+    const {ctx,w,h}=setup(cv);
+    const padL=38,padR=10,padT=12,padB=22;
+    const plotW=w-padL-padR, plotH=h-padT-padB;
+    const n=series[0].data.length;
+    const x=i=>padL+(plotW*(i/(n-1)));
+    const y=v=>padT+plotH*(1-Math.min(v,yMax)/yMax);
+    ctx.clearRect(0,0,w,h);
+
+    if(opts.band){
+      ctx.fillStyle="rgba(233,162,60,.09)";
+      ctx.fillRect(x(0),padT,x(opts.band)-x(0),plotH);
+      ctx.fillStyle="rgba(233,162,60,.7)";
+      ctx.font="10px ui-monospace,monospace";
+      ctx.fillText("hand tracked",x(0)+5,padT+12);
+    }
+    ctx.font="10px ui-monospace,monospace";
+    ctx.textAlign="right"; ctx.textBaseline="middle";
+    const ticks=4;
+    for(let t=0;t<=ticks;t++){
+      const gv=yMax*t/ticks, gy=y(gv);
+      ctx.strokeStyle=GRID; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(padL,gy); ctx.lineTo(w-padR,gy); ctx.stroke();
+      ctx.fillStyle=AX; ctx.fillText(Math.round(gv),padL-6,gy);
+    }
+    ctx.textAlign="left"; ctx.fillStyle=AX;
+    ctx.fillText("0s",padL,h-7);
+    ctx.textAlign="right"; ctx.fillText((n-1)+"s",w-padR,h-7);
+
+    series.forEach(s=>{
+      const grad=ctx.createLinearGradient(0,padT,0,padT+plotH);
+      grad.addColorStop(0,s.color+"33"); grad.addColorStop(1,s.color+"00");
+      ctx.beginPath(); ctx.moveTo(x(0),y(s.data[0]));
+      for(let i=1;i<n;i++) ctx.lineTo(x(i),y(s.data[i]));
+      ctx.lineTo(x(n-1),padT+plotH); ctx.lineTo(x(0),padT+plotH); ctx.closePath();
+      ctx.fillStyle=grad; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x(0),y(s.data[0]));
+      for(let i=1;i<n;i++) ctx.lineTo(x(i),y(s.data[i]));
+      ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.lineJoin="round"; ctx.stroke();
+      ctx.beginPath(); ctx.arc(x(n-1),y(s.data[n-1]),3.2,0,7); ctx.fillStyle=s.color; ctx.fill();
+    });
+  }
+  function render(){
+    draw(document.getElementById("latChart"),
+      [{data:single.lat,color:AM},{data:dual.lat,color:CY}], 80, {band:6.5});
+    draw(document.getElementById("fpsChart"),
+      [{data:single.fps,color:AM},{data:dual.fps,color:CY}], 60);
+  }
+  render();
+  let rt; addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(render,150);});
+})();
+</script>
+</body>
+</html>

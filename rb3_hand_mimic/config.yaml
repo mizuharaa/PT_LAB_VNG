@@ -169,11 +169,18 @@ hand:
   controller: "sdk"
   sdk:
     library: "dexh15"        # "dexh15" (Paxini) | "placeholder" | <ARM64 binding>
-  # DexH15 (Paxini) bridge: this app runs on the RB3 (ARM64) and ships 11 joint
-  # angles [0..1000] to the DexH15 C++ SDK running inside an x86 VM, which calls
-  # setJointPositionsAngle(). Placeholder until the bridge process exists.
+  # DexH15 (Paxini) hand. The vendor C++ SDK is x86-only, so on the RB3 (ARM64)
+  # the hand is driven at the protocol level (Modbus-RTU / USB-CDC) from Python.
+  #   interface: "motor" -> 7 raw motor positions [0..10000] (the real registers,
+  #                         simplest over the protocol; DEFAULT)
+  #              "joint" -> 11 normalized joint angles (needs the SDK's joint->
+  #                         motor kinematics)
+  # host/port are only used if you instead relay to the C++ SDK in an x86 VM.
   dexh15:
-    host: "127.0.0.1"        # x86 VM address reachable from the RB3
+    interface: "motor"
+    slave_address: 0x79      # Modbus slave id of the hand
+    motor_full: 8000         # motor position at full curl (<= 10000)
+    host: "127.0.0.1"        # x86-VM relay address (only for the C++ SDK route)
     port: 50515
   port: "auto"             # (serial) "auto" or explicit, e.g. "/dev/ttyACM0"
   baudrate: 115200

@@ -1,28 +1,30 @@
-"""Placeholder for the Paxini DexH15 hand SDK protocol.
+"""Placeholder for the Paxini DexH15 (GMH15) dexterous-hand SDK / protocol.
 
-Target deployment topology
---------------------------
-    Camera (OV9282) ─► MediaPipe (this app, RB3 / ARM64, native)
-        ─► map landmarks → 11 normalized joint angles [0..1000]
-            ─► **DexH15 C++ SDK (runs inside an x86 VM)**
-                ─► sdk.setJointPositionsAngle(angles)
-                    ─► robotic hand moves
+Aligned to the vendor docs (DexHandSDK V3.0.0 "API Reference" + "Getting Started"):
 
-The DexH15 SDK is a C++ library that only runs on x86, so it cannot be loaded
-in-process on the RB3 (aarch64). The integration therefore crosses a machine
-boundary: this app computes the 11 joint angles on the RB3 and ships them to a
-small bridge process inside the x86 VM, which calls the real
-`setJointPositionsAngle()` on the SDK.
+  * The real SDK is **C++ only** (DexHandSDK-3.0.0-Linux.deb, namespace
+    paxini::bot::dexh15) and requires an **x86 / x86_64** CPU on Ubuntu 22.04 --
+    so it does NOT run natively on the RB3 (aarch64) and has no Python binding.
+  * The hand itself is a serial device speaking **Modbus-RTU** (RS-485 / USB-485,
+    e.g. /dev/ttyUSB0, slave 0x79, baud up to 4,000,000) or **USB 2.0 / USB-CDC**
+    (/dev/ttyACM0). Because that is just serial I/O, a pure-Python driver runs on
+    *any* architecture -- including the RB3 -- which is why driving the hand at
+    the protocol level (the route the other engineer took) is the path that lets
+    everything run on the RB3 with no x86 VM.
 
-This module is a PLACEHOLDER for that boundary. It:
-  * defines the 11-joint layout and the [0..1000] angle convention,
-  * maps our 5 normalized finger curls → 11 joint angles,
-  * models the RB3→VM transport (DexH15Bridge) with a documented wire format,
-  * exposes a `DexH15HandSdk` that plugs into the project's `HandSdk` interface.
+Two command interfaces the hand exposes (this module supports both):
 
-Nothing here talks to real hardware yet. Everything marked ``TODO(dexh15)`` is a
-spot to wire the real SDK / transport once it is available. The exact joint
-order, ranges, and direction MUST be confirmed against the DexH15 SDK docs.
+  * "motor"  -> 7 raw motor positions (setMotorTargetPosition / Dex15MotorPosition).
+                These are the actual registers; simplest to drive over the raw
+                protocol from Python, and they map almost 1:1 from our 5 curls.
+                DEFAULT.
+  * "joint"  -> 11 normalized joint angles (setJointPositionsAngle). A convenience
+                layer that runs joint->motor inverse kinematics *inside* the SDK,
+                so a protocol-level Python driver would have to re-derive that.
+
+This file still touches no hardware. Replace DexH15Bridge's TODO bodies with the
+engineer's pyserial/Modbus implementation (or a binding to the C++ SDK) and the
+rest of the pipeline is unchanged.
 """
 
 from __future__ import annotations
@@ -36,84 +38,114 @@ from .utils import FINGERS, clamp, get_logger
 
 log = get_logger("dexh15")
 
-# Normalized joint command range expected by setJointPositionsAngle().
+# -----------------------------------------------------------------------------
+# Value ranges (from the API Reference)
+# -----------------------------------------------------------------------------
+# Normalized joint angles: [0, 1000], EXCEPT thumb_joint1 (lateral swing) is
+# centered at 0 with range [-500, 500].
 ANGLE_MIN = 0
 ANGLE_MAX = 1000
+THUMB_SWING_MIN = -500
+THUMB_SWING_MAX = 500
+# Raw motor positions span [0, 10000] (forwardKinematicParse). 0 == open/zero
+# pose; larger == more flexed. We scale to `motor_full` (<= 10000) so we never
+# slam to an unverified hardware maximum.
+MOTOR_MIN = 0
+MOTOR_MAX = 10000
 
 # -----------------------------------------------------------------------------
-# Joint layout (PLACEHOLDER -- confirm against the real DexH15 SDK)
+# Joint layout -- 11 normalized joints, exact order from setJointPositionsAngle.
+# index(2) -> middle(2) -> ring(2) -> little(2) -> thumb(3)
 # -----------------------------------------------------------------------------
-# 11 controllable joints. We currently estimate one flexion scalar per finger
-# (+ a thumb that also carries adduction), so several joints are driven from the
-# same source until richer per-joint estimation (or the 2nd camera) is wired.
-# Index in this tuple == joint index passed to setJointPositionsAngle().
 JOINT_NAMES: List[str] = [
-    "thumb_rotation",  # 0  thumb opposition / CMC rotation
-    "thumb_mcp",       # 1  thumb MCP flexion
-    "thumb_ip",        # 2  thumb IP flexion
-    "index_mcp",       # 3  index MCP flexion
-    "index_pip",       # 4  index PIP flexion
-    "middle_mcp",      # 5  middle MCP flexion
-    "middle_pip",      # 6  middle PIP flexion
-    "ring_mcp",        # 7  ring MCP flexion
-    "ring_pip",        # 8  ring PIP flexion
-    "pinky_mcp",       # 9  pinky MCP flexion
-    "pinky_pip",       # 10 pinky PIP flexion
+    "index_joint1",   # 0  proximal flex   [0,1000]
+    "index_joint2",   # 1  end flex        [0,1000]
+    "middle_joint1",  # 2                  [0,1000]
+    "middle_joint2",  # 3                  [0,1000]
+    "ring_joint1",    # 4                  [0,1000]
+    "ring_joint2",    # 5                  [0,1000]
+    "little_joint1",  # 6                  [0,1000]
+    "little_joint2",  # 7                  [0,1000]
+    "thumb_joint1",   # 8  lateral swing   [-500,500]
+    "thumb_joint2",   # 9  proximal flex   [0,1000]
+    "thumb_joint3",   # 10 end flex        [0,1000]
 ]
 NUM_JOINTS = len(JOINT_NAMES)
 
-# How each of the 11 joints is driven from our per-finger curl (0..1). Most
-# joints map 1:1 to the owning finger's curl; the thumb's three joints share the
-# thumb curl. ``scale`` lets a joint use less than the full travel (e.g. a PIP
-# that should not fully close). TODO(dexh15): replace with the real per-joint
-# kinematics once joint limits/coupling are known.
-@dataclass(frozen=True)
-class _JointDrive:
-    finger: str        # which finger curl drives this joint
-    scale: float = 1.0  # fraction of [0..1000] travel to use
+# -----------------------------------------------------------------------------
+# Motor layout -- 7 motors, order from Dex15MotorPosition (Getting Started 4.1.2)
+# -----------------------------------------------------------------------------
+MOTOR_NAMES: List[str] = [
+    "index_flex",        # 1 index-finger flexion
+    "middle_flex",       # 2 middle-finger flexion
+    "ring_flex",         # 3 ring-finger flexion
+    "pinky_flex",        # 4 little-finger flexion
+    "four_finger_base",  # 5 common base of the four fingers (spread/abduction)
+    "thumb_lower",       # 6 thumb lower joint
+    "thumb_upper",       # 7 thumb upper joint
+]
+NUM_MOTORS = len(MOTOR_NAMES)
 
 
-_JOINT_DRIVE: Dict[str, _JointDrive] = {
-    "thumb_rotation": _JointDrive("thumb", 0.8),
-    "thumb_mcp": _JointDrive("thumb", 1.0),
-    "thumb_ip": _JointDrive("thumb", 0.9),
-    "index_mcp": _JointDrive("index", 1.0),
-    "index_pip": _JointDrive("index", 0.95),
-    "middle_mcp": _JointDrive("middle", 1.0),
-    "middle_pip": _JointDrive("middle", 0.95),
-    "ring_mcp": _JointDrive("ring", 1.0),
-    "ring_pip": _JointDrive("ring", 0.95),
-    "pinky_mcp": _JointDrive("pinky", 1.0),
-    "pinky_pip": _JointDrive("pinky", 0.95),
-}
+def map_curls_to_motors(curls: Dict[str, float], motor_full: int = 8000) -> List[int]:
+    """Map 5 normalized finger curls (0..1) -> 7 raw motor positions.
+
+    PLACEHOLDER kinematics. `motor_full` is the position commanded at curl == 1
+    (kept below the 10000 ceiling until per-unit limits are confirmed). Motor 5
+    (four-finger base / spread) has no single-camera estimate, so it stays at
+    its neutral 0; wire it up once finger-abduction is estimated or the 2nd
+    camera is in. Returns NUM_MOTORS ints in MOTOR order.
+    """
+    def pos(name: str) -> int:
+        v = clamp(float(curls.get(name, 0.0)), 0.0, 1.0)
+        return int(max(MOTOR_MIN, min(MOTOR_MAX, round(v * motor_full))))
+
+    return [
+        pos("index"),
+        pos("middle"),
+        pos("ring"),
+        pos("pinky"),
+        0,                 # four_finger_base: neutral (TODO: finger spread)
+        pos("thumb"),      # thumb_lower
+        pos("thumb"),      # thumb_upper
+    ]
 
 
 def map_curls_to_joints(curls: Dict[str, float]) -> List[int]:
-    """Map 5 normalized finger curls (0..1) → 11 joint angles in [0..1000].
+    """Map 5 normalized finger curls (0..1) -> 11 normalized joint angles.
 
-    PLACEHOLDER kinematics: each joint takes its owning finger's curl, scaled and
-    quantized to the integer command range. Returns a list of length NUM_JOINTS
-    ordered to match JOINT_NAMES / the SDK joint indices.
+    PLACEHOLDER. Each finger's curl drives both of its joints; thumb curl drives
+    thumb_joint2/3 (flexion). thumb_joint1 (lateral swing, [-500,500]) has no
+    single-camera estimate, so it stays neutral at 0 (TODO: thumb adduction).
+    Returns NUM_JOINTS ints, matching JOINT_NAMES / SDK joint order.
     """
-    out: List[int] = []
-    for name in JOINT_NAMES:
-        drive = _JOINT_DRIVE[name]
-        curl = clamp(float(curls.get(drive.finger, 0.0)), 0.0, 1.0)
-        angle = int(round(curl * drive.scale * ANGLE_MAX))
-        out.append(max(ANGLE_MIN, min(ANGLE_MAX, angle)))
-    return out
+    def ang(name: str, scale: float = 1.0) -> int:
+        v = clamp(float(curls.get(name, 0.0)), 0.0, 1.0)
+        return int(max(ANGLE_MIN, min(ANGLE_MAX, round(v * scale * ANGLE_MAX))))
+
+    return [
+        ang("index"), ang("index", 0.95),
+        ang("middle"), ang("middle", 0.95),
+        ang("ring"), ang("ring", 0.95),
+        ang("pinky"), ang("pinky", 0.95),
+        0,                                  # thumb_joint1: neutral swing [-500,500]
+        ang("thumb"), ang("thumb", 0.9),    # thumb_joint2, thumb_joint3
+    ]
 
 
 # -----------------------------------------------------------------------------
-# Transport bridge: RB3 (this app) ─► x86 VM (real DexH15 C++ SDK)
+# Transport bridge: RB3 (this app) <-> the hand (or an x86-VM SDK relay)
 # -----------------------------------------------------------------------------
 @dataclass
 class DexH15Config:
-    """Connection settings for the bridge to the x86 VM hosting the SDK."""
+    """Connection + command settings for the DexH15 hand."""
 
-    host: str = "127.0.0.1"   # the x86 VM address reachable from the RB3
+    host: str = "127.0.0.1"     # x86-VM relay address (only if using the C++ SDK)
     port: int = 50515
     connect_timeout: float = 1.0
+    interface: str = "motor"    # "motor" (7 positions) | "joint" (11 angles)
+    slave_address: int = 0x79   # Modbus slave id of the hand
+    motor_full: int = 8000      # motor position commanded at curl == 1
 
     @classmethod
     def from_dict(cls, d: Dict) -> "DexH15Config":
@@ -122,41 +154,43 @@ class DexH15Config:
             host=str(d.get("host", "127.0.0.1")),
             port=int(d.get("port", 50515)),
             connect_timeout=float(d.get("connect_timeout", 1.0)),
+            interface=str(d.get("interface", "motor")).lower(),
+            slave_address=int(d.get("slave_address", 0x79)),
+            motor_full=int(d.get("motor_full", 8000)),
         )
 
 
 class DexH15Bridge:
-    """Placeholder client for the bridge process inside the x86 VM.
+    """Placeholder transport to the hand. Validates + logs; opens no port yet.
 
-    Wire format (proposed, newline-delimited JSON over TCP) -- one object per
-    command, mirroring the SDK calls the bridge will make:
+    Proposed wire format (newline-delimited JSON over TCP/serial), one command
+    per line, mirroring the SDK calls a real driver makes:
 
-        {"cmd": "setJointPositionsAngle", "angles": [<11 ints 0..1000>]}
-        {"cmd": "getJointPositionsAngle"}
-        {"cmd": "ping"}
+        {"cmd":"setMotorTargetPosition","slave":121,"pos":[<7 ints 0..10000>]}
+        {"cmd":"setJointPositionsAngle","slave":121,"angles":[<11 ints>]}
 
-    The real bridge unpacks ``angles`` and calls the C++
-    ``setJointPositionsAngle()``. Today this class only validates and logs; no
-    socket is opened. TODO(dexh15): open a TCP socket to (host, port) and send
-    these frames.
+    Real init handshake the driver MUST perform before streaming commands
+    (Getting Started 3.2.1) -- otherwise the hand will not move:
+        open serial -> initModbusDevice(slave) -> initMotorPosition(slave)
+        -> setMotorControlMode(slave, POSITION) -> enableMotor(slave)
+        ... stream commands ...
+        -> disableMotor(slave) -> close serial
     """
 
     def __init__(self, cfg: DexH15Config) -> None:
         self.cfg = cfg
         self._connected = False
-        self._sock = None
         self._count = 0
         self._log_every = 30
 
     def connect(self) -> bool:
-        # TODO(dexh15): open a real socket, e.g.
-        #   self._sock = socket.create_connection((cfg.host, cfg.port),
-        #                                          timeout=cfg.connect_timeout)
+        # TODO(dexh15): open the serial/Modbus port (or socket to the x86-VM
+        # relay) and run the init handshake described above.
         self._connected = True
         log.info(
-            "DexH15Bridge placeholder connected (NO TRANSPORT). Would reach the "
-            "x86 VM SDK at %s:%d. Commands are validated + logged only.",
-            self.cfg.host, self.cfg.port,
+            "DexH15Bridge placeholder connected (NO TRANSPORT). interface=%s "
+            "slave=0x%02X. Commands validated + logged only.",
+            self.cfg.interface, self.cfg.slave_address,
         )
         return True
 
@@ -164,27 +198,34 @@ class DexH15Bridge:
         return self._connected
 
     def _send(self, message: Dict) -> bool:
-        """Serialize + 'send' one command frame. Placeholder logs it."""
         if not self._connected:
             return False
         frame = json.dumps(message, separators=(",", ":")) + "\n"
-        # TODO(dexh15): self._sock.sendall(frame.encode("utf-8"))
+        # TODO(dexh15): write `frame` (or the equivalent Modbus register writes).
         self._count += 1
         if self._count % self._log_every == 0:
             log.debug("DexH15 -> %s", frame.rstrip("\n"))
         return True
 
-    def setJointPositionsAngle(self, angles: List[int]) -> bool:  # noqa: N802 (matches SDK)
-        """Command all 11 joints. `angles` are integers in [0..1000]."""
-        if len(angles) != NUM_JOINTS:
-            log.error("expected %d joint angles, got %d; dropping command",
-                      NUM_JOINTS, len(angles))
+    def setMotorTargetPosition(self, positions: List[int]) -> bool:  # noqa: N802 (SDK name)
+        """Command all 7 motor positions (raw, [0..10000])."""
+        if len(positions) != NUM_MOTORS:
+            log.error("expected %d motor positions, got %d", NUM_MOTORS, len(positions))
             return False
-        clamped = [max(ANGLE_MIN, min(ANGLE_MAX, int(a))) for a in angles]
-        return self._send({"cmd": "setJointPositionsAngle", "angles": clamped})
+        clamped = [int(max(MOTOR_MIN, min(MOTOR_MAX, p))) for p in positions]
+        return self._send({"cmd": "setMotorTargetPosition",
+                           "slave": self.cfg.slave_address, "pos": clamped})
+
+    def setJointPositionsAngle(self, angles: List[int]) -> bool:  # noqa: N802 (SDK name)
+        """Command all 11 normalized joint angles."""
+        if len(angles) != NUM_JOINTS:
+            log.error("expected %d joint angles, got %d", NUM_JOINTS, len(angles))
+            return False
+        return self._send({"cmd": "setJointPositionsAngle",
+                           "slave": self.cfg.slave_address, "angles": list(angles)})
 
     def disconnect(self) -> None:
-        # TODO(dexh15): close the socket if open.
+        # TODO(dexh15): disableMotor + close the port.
         self._connected = False
         log.info("DexH15Bridge placeholder disconnected (sent %d commands)", self._count)
 
@@ -192,10 +233,9 @@ class DexH15Bridge:
 # -----------------------------------------------------------------------------
 # HandSdk adapter -- plugs DexH15 into the project's controller abstraction
 # -----------------------------------------------------------------------------
-# hand_controller imports this module only lazily (inside load_hand_sdk), so
-# importing HandSdk at module level here does not create a runtime import cycle.
 class DexH15HandSdk(HandSdk):
-    """Drives the DexH15 hand: 5 finger curls → 11 joints → bridge → x86 SDK."""
+    """Drives the DexH15 hand from 5 finger curls via the configured interface
+    (7 motor positions by default, or 11 joint angles)."""
 
     def __init__(self, cfg: Optional[DexH15Config] = None,
                  finger_order: Optional[List[str]] = None) -> None:
@@ -207,8 +247,10 @@ class DexH15HandSdk(HandSdk):
         return self._bridge.connect()
 
     def set_curls(self, curls: Dict[str, float]) -> bool:
-        angles = map_curls_to_joints(curls)
-        return self._bridge.setJointPositionsAngle(angles)
+        if self.cfg.interface == "joint":
+            return self._bridge.setJointPositionsAngle(map_curls_to_joints(curls))
+        return self._bridge.setMotorTargetPosition(
+            map_curls_to_motors(curls, self.cfg.motor_full))
 
     def is_connected(self) -> bool:
         return self._bridge.is_connected()
